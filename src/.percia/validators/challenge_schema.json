@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PERCIA Challenge Schema v2.0",
+  "type": "object",
+  "required": ["target_proposal", "author_ia", "challenge"],
+  "properties": {
+    "target_proposal": {"type": "string"},
+    "author_ia": {"type": "string", "pattern": "^ia-[a-z0-9-]+$"},
+    "challenge": {
+      "type": "object",
+      "required": ["type", "issue"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["logical", "empirical", "architectural", "constraint_violation", "risk"]
+        },
+        "issue": {"type": "string", "minLength": 30}
+      }
+    }
+  }
+}
