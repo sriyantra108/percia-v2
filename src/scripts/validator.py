@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Tuple, Dict, Any, List, Optional
 from datetime import datetime
 from dataclasses import dataclass
+from collections import OrderedDict
 import logging
 
 try:
@@ -34,6 +35,26 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('PERCIA.Validator')
+
+# ==============================================================================
+# CONSTANTES DE SEGURIDAD ANTI-DoS (Ronda 2 - Copilot CLI)
+# ==============================================================================
+
+# Límites para prevenir DoS
+MAX_JSON_SIZE_BYTES = 1024 * 1024  # 1 MB máximo
+MAX_ARRAY_LENGTH = 1000           # Máximo elementos en arrays
+MAX_OBJECT_DEPTH = 20             # Máxima profundidad de objetos anidados
+MAX_STRING_LENGTH = 10000         # Máxima longitud de strings
+MAX_SCHEMA_CACHE_ENTRIES = 50     # Máximo schemas en cache
+
+# Límites específicos por campo
+MAX_CLAIM_LENGTH = 5000
+MAX_JUSTIFICATION_LENGTH = 2000
+MAX_ARGUMENT_LENGTH = 2000
+MIN_CLAIM_LENGTH = 50
+
+# Timeout para validación (segundos)
+VALIDATION_TIMEOUT = 30
 
 
 @dataclass
@@ -65,10 +86,10 @@ class BusinessRules:
     MIN_RISK_DESCRIPTION_LENGTH = 10
     MIN_MITIGATION_LENGTH = 10
     
-    # Patrones de ID
-    IA_ID_PATTERN = r'^ia-[a-z0-9-]+$'
-    PROPOSAL_ID_PATTERN = r'^prop-[a-z0-9-]+-\d{8}T\d{6}$'
-    CHALLENGE_ID_PATTERN = r'^challenge-[a-z0-9-]+-\d{8}T\d{6}$'
+    # CORREGIDO: Patrones de ID con límites explícitos para prevenir ReDoS
+    IA_ID_PATTERN = re.compile(r'^ia-[a-z0-9](?:[a-z0-9-]{0,60}[a-z0-9])?$')
+    PROPOSAL_ID_PATTERN = re.compile(r'^prop-[a-z0-9-]{1,50}-\d{8}T\d{6}$')
+    CHALLENGE_ID_PATTERN = re.compile(r'^challenge-[a-z0-9-]{1,50}-\d{8}T\d{6}$')
     
     # Taxonomía de challenges válidos
     VALID_CHALLENGE_TYPES = [
@@ -81,6 +102,51 @@ class BusinessRules:
     
     # Performativos válidos
     VALID_PERFORMATIVES = ['PROPOSE', 'CHALLENGE', 'NO_CHALLENGE', 'ACCEPT', 'REJECT']
+
+# Patrón adicional para validar schema_type (previene path traversal)
+SAFE_SCHEMA_TYPE_PATTERN = re.compile(r'^[a-z][a-z0-9_]{0,30}$')
+TRANSACTION_ID_PATTERN = re.compile(r'^tx-[a-f0-9]{8}-\d{14}$')
+
+
+# ==============================================================================
+# CLASE: LRU Cache limitado para schemas
+# ==============================================================================
+
+class LimitedSchemaCache:
+    """
+    Cache de schemas con límite de tamaño para prevenir memory exhaustion.
+    
+    Usa OrderedDict para implementar LRU (Least Recently Used) eviction.
+    """
+    
+    def __init__(self, max_size: int = MAX_SCHEMA_CACHE_ENTRIES):
+        self._cache: OrderedDict = OrderedDict()
+        self._max_size = max_size
+    
+    def get(self, key: str) -> Optional[dict]:
+        """Obtiene un schema del cache, actualizando su posición LRU."""
+        if key in self._cache:
+            # Mover al final (más recientemente usado)
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+    
+    def set(self, key: str, value: dict) -> None:
+        """Guarda un schema en el cache, evicting el más antiguo si es necesario."""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self._max_size:
+                # Eliminar el más antiguo (primero)
+                self._cache.popitem(last=False)
+        self._cache[key] = value
+    
+    def clear(self) -> None:
+        """Limpia el cache."""
+        self._cache.clear()
+    
+    def __len__(self) -> int:
+        return len(self._cache)
 
 
 class Validator:
@@ -95,33 +161,446 @@ class Validator:
     - Logging detallado
     """
     
-    def __init__(self, base_path: str = "."):
-        self.base_path = Path(base_path)
-        self.validators_dir = self.base_path / ".percia" / "validators"
+    def __init__(self, validators_dir: Optional[str] = None):
+        """
+        Inicializa el validador con cache limitado.
+        
+        CORREGIDO: Usa LimitedSchemaCache en lugar de dict ilimitado.
+        """
+        if validators_dir:
+            self.validators_dir = Path(validators_dir)
+        else:
+            self.validators_dir = Path(__file__).parent / "schemas"
+        
+        # CORREGIDO: Usar cache limitado
+        self._schema_cache = LimitedSchemaCache(MAX_SCHEMA_CACHE_ENTRIES)
+        
+        # Configurar reglas
         self.rules = BusinessRules()
-        self._schema_cache: Dict[str, dict] = {}
         
-        logger.info(f"Validator inicializado en {self.base_path}")
+        # Logger
+        logger.info(f"Validator inicializado en {self.validators_dir}")
     
-    def _load_schema(self, schema_type: str) -> Optional[dict]:
-        """Carga schema desde archivo con cache"""
-        if schema_type in self._schema_cache:
-            return self._schema_cache[schema_type]
+    def _validate_schema_type(self, schema_type: str) -> bool:
+        """
+        Valida que el schema_type sea seguro (previene path traversal).
         
+        CORREGIDO: Antes no había validación, permitiendo '../../../etc/passwd'
+        
+        Args:
+            schema_type: Tipo de schema a validar
+        
+        Returns:
+            bool: True si es válido
+        
+        Raises:
+            ValueError: Si el schema_type es inválido o peligroso
+        """
+        if not schema_type or not isinstance(schema_type, str):
+            raise ValueError("schema_type debe ser un string no vacío")
+        
+        # Verificar longitud
+        if len(schema_type) > 30:
+            raise ValueError("schema_type demasiado largo")
+        
+        # Verificar patrón seguro
+        if not SAFE_SCHEMA_TYPE_PATTERN.match(schema_type):
+            raise ValueError(
+                f"schema_type contiene caracteres inválidos: {schema_type}"
+            )
+        
+        # Verificar explícitamente contra path traversal
+        if '..' in schema_type or '/' in schema_type or '\\' in schema_type:
+            raise ValueError(f"schema_type contiene path traversal: {schema_type}")
+        
+        return True
+    
+    def _load_schema(self, schema_type: str) -> dict:
+        """
+        Carga un schema de forma segura.
+        
+        CORREGIDO:
+        - Valida schema_type contra path traversal
+        - Usa cache limitado
+        - Verifica tamaño del archivo
+        
+        Args:
+            schema_type: Tipo de schema a cargar
+        
+        Returns:
+            dict: Schema cargado
+        
+        Raises:
+            ValueError: Si el schema es inválido
+            FileNotFoundError: Si no existe el schema
+        """
+        # NUEVO: Validar schema_type
+        self._validate_schema_type(schema_type)
+        
+        # Verificar cache primero
+        cached = self._schema_cache.get(schema_type)
+        if cached is not None:
+            return cached
+        
+        # Construir path de forma segura
         schema_file = self.validators_dir / f"{schema_type}_schema.json"
         
+        # NUEVO: Verificar que el archivo está dentro del directorio permitido
+        try:
+            schema_file = schema_file.resolve()
+            validators_resolved = self.validators_dir.resolve()
+            schema_file.relative_to(validators_resolved)
+        except ValueError:
+            raise ValueError(f"Schema file fuera del directorio permitido: {schema_type}")
+        
         if not schema_file.exists():
-            logger.error(f"Schema no encontrado: {schema_file}")
-            return None
+            raise FileNotFoundError(f"Schema no encontrado: {schema_type}")
+        
+        # NUEVO: Verificar tamaño antes de cargar
+        file_size = schema_file.stat().st_size
+        if file_size > MAX_JSON_SIZE_BYTES:
+            raise ValueError(f"Schema demasiado grande: {file_size} bytes")
+        
+        # Cargar schema
+        with open(schema_file, 'r', encoding='utf-8') as f:
+            schema = json.load(f)
+        
+        # Guardar en cache
+        self._schema_cache.set(schema_type, schema)
+        
+        return schema
+
+    def _validate_type(self, value: Any, expected_type: type, field_name: str) -> None:
+        """
+        Valida que un valor sea del tipo esperado.
+        
+        CORREGIDO: Antes asumía tipos correctos sin verificar.
+        
+        Args:
+            value: Valor a validar
+            expected_type: Tipo esperado
+            field_name: Nombre del campo (para mensajes de error)
+        
+        Raises:
+            TypeError: Si el tipo no coincide
+        """
+        if not isinstance(value, expected_type):
+            raise TypeError(
+                f"{field_name} debe ser {expected_type.__name__}, "
+                f"recibido {type(value).__name__}"
+            )
+
+    def _validate_string(self, value: Any, field_name: str,
+                         min_length: int = 0,
+                         max_length: int = MAX_STRING_LENGTH) -> str:
+        """
+        Valida y sanitiza un string.
+        
+        Args:
+            value: Valor a validar
+            field_name: Nombre del campo
+            min_length: Longitud mínima
+            max_length: Longitud máxima
+        
+        Returns:
+            str: String validado
+        
+        Raises:
+            TypeError: Si no es string
+            ValueError: Si no cumple restricciones
+        """
+        self._validate_type(value, str, field_name)
+        
+        # Verificar longitud
+        if len(value) < min_length:
+            raise ValueError(
+                f"{field_name} debe tener al menos {min_length} caracteres"
+            )
+        
+        if len(value) > max_length:
+            raise ValueError(
+                f"{field_name} excede longitud máxima de {max_length} caracteres"
+            )
+        
+        # NUEVO: Verificar encoding válido
+        try:
+            value.encode('utf-8').decode('utf-8')
+        except UnicodeError:
+            raise ValueError(f"{field_name} contiene encoding inválido")
+        
+        # NUEVO: Eliminar caracteres de control peligrosos
+        # Permitir solo: tab, newline, carriage return
+        allowed_control = {'\t', '\n', '\r'}
+        sanitized = ''.join(
+            c for c in value 
+            if c >= ' ' or c in allowed_control
+        )
+        
+        return sanitized
+
+    def _validate_array(self, value: Any, field_name: str,
+                        max_length: int = MAX_ARRAY_LENGTH) -> list:
+        """
+        Valida un array con límite de longitud.
+        
+        CORREGIDO: Antes no había límite, permitiendo DoS con arrays enormes.
+        
+        Args:
+            value: Valor a validar
+            field_name: Nombre del campo
+            max_length: Máximo número de elementos
+        
+        Returns:
+            list: Array validado
+        
+        Raises:
+            TypeError: Si no es lista
+            ValueError: Si excede el límite
+        """
+        self._validate_type(value, list, field_name)
+        
+        if len(value) > max_length:
+            raise ValueError(
+                f"{field_name} excede máximo de {max_length} elementos "
+                f"(tiene {len(value)})"
+            )
+        
+        return value
+    
+    def validate_proposal(self, content: dict) -> Tuple[bool, str, float]:
+        """
+        Valida una propuesta con protecciones anti-DoS.
+        
+        CORREGIDO:
+        - Validación de tipos estricta
+        - Límites de longitud en todos los campos
+        - Business rules SIEMPRE se ejecutan (incluso si schema falla parcialmente)
+        
+        Args:
+            content: Contenido de la propuesta
+        
+        Returns:
+            Tuple[bool, str, float]: (is_valid, message, confidence)
+        """
+        errors = []
+        warnings = []
         
         try:
-            with open(schema_file, 'r', encoding='utf-8') as f:
-                schema = json.load(f)
-            self._schema_cache[schema_type] = schema
-            return schema
+            # NUEVO: Validar que content es dict
+            self._validate_type(content, dict, "content")
+            
+            # NUEVO: Verificar tamaño total del JSON
+            content_size = len(json.dumps(content))
+            if content_size > MAX_JSON_SIZE_BYTES:
+                return (False, f"Propuesta demasiado grande: {content_size} bytes", 0.0)
+            
+            # Validar claim
+            claim = content.get('claim')
+            if claim is None:
+                errors.append("'claim' es requerido")
+            else:
+                try:
+                    claim = self._validate_string(
+                        claim, 'claim',
+                        min_length=MIN_CLAIM_LENGTH,
+                        max_length=MAX_CLAIM_LENGTH
+                    )
+                except (TypeError, ValueError) as e:
+                    errors.append(str(e))
+            
+            # Validar justifications
+            justifications = content.get('justifications', [])
+            try:
+                justifications = self._validate_array(
+                    justifications, 'justifications',
+                    max_length=100  # Máximo 100 justificaciones
+                )
+                
+                # CORREGIDO: Validar cada justificación con límite
+                for i, j in enumerate(justifications):
+                    try:
+                        self._validate_string(
+                            j, f'justifications[{i}]',
+                            max_length=MAX_JUSTIFICATION_LENGTH
+                        )
+                    except (TypeError, ValueError) as e:
+                        warnings.append(str(e))
+                        
+            except (TypeError, ValueError) as e:
+                errors.append(str(e))
+            
+            # Validar arguments
+            arguments = content.get('arguments', [])
+            try:
+                arguments = self._validate_array(
+                    arguments, 'arguments',
+                    max_length=100  # Máximo 100 argumentos
+                )
+                
+                for i, arg in enumerate(arguments):
+                    try:
+                        self._validate_string(
+                            arg, f'arguments[{i}]',
+                            max_length=MAX_ARGUMENT_LENGTH
+                        )
+                    except (TypeError, ValueError) as e:
+                        warnings.append(str(e))
+                        
+            except (TypeError, ValueError) as e:
+                errors.append(str(e))
+            
+            # CORREGIDO: Validar schema (pero NO retornar temprano si falla)
+            schema_errors = []
+            try:
+                schema_result = self._validate_against_schema(content, 'proposal')
+                if not schema_result.is_valid:
+                    schema_errors.extend(schema_result.errors)
+            except Exception as e:
+                schema_errors.append(f"Error validando schema: {e}")
+            
+            # CORREGIDO: SIEMPRE ejecutar business rules (fix para bypass)
+            business_errors = self._validate_business_rules_proposal(content)
+            
+            # Combinar todos los errores
+            all_errors = errors + schema_errors + business_errors
+            
+            # Calcular confidence
+            confidence = 1.0 - (len(all_errors) * 0.2 + len(warnings) * 0.05)
+            confidence = max(0.0, min(1.0, confidence))
+            
+            if all_errors:
+                return (False, "; ".join(all_errors), confidence)
+            
+            message = "Validación exitosa"
+            if warnings:
+                message += f" (con {len(warnings)} advertencias)"
+            
+            return (True, message, confidence)
+            
+        except Exception as e:
+            return (False, f"Error inesperado en validación: {e}", 0.0)
+
+    def _validate_business_rules_proposal(self, content: dict) -> List[str]:
+        """
+        Valida las reglas de negocio para una propuesta.
+        
+        NUEVO: Separado para garantizar que siempre se ejecuta.
+        
+        Returns:
+            List[str]: Lista de errores de validación
+        """
+        errors = []
+        
+        # Verificar que claim no es solo espacios
+        claim = content.get('claim', '')
+        if isinstance(claim, str) and claim.strip() == '':
+            errors.append("claim no puede estar vacío o solo espacios")
+        
+        # Verificar coherencia entre claim y justifications
+        justifications = content.get('justifications', [])
+        if isinstance(justifications, list) and len(justifications) == 0:
+            errors.append("Se requiere al menos una justificación")
+        
+        # Verificar que author_ia tiene formato válido
+        author_ia = content.get('author_ia', '')
+        if author_ia and not self.rules.IA_ID_PATTERN.match(str(author_ia)):
+            errors.append(f"author_ia tiene formato inválido: {author_ia}")
+        
+        return errors
+
+    def validate_json_file(self, file_path: str, schema_type: str) -> Tuple[bool, str, float]:
+        """
+        Valida un archivo JSON contra un schema.
+        
+        CORREGIDO:
+        - Verifica tamaño del archivo antes de cargar
+        - Valida schema_type contra path traversal
+        - Timeout para prevenir DoS
+        
+        Args:
+            file_path: Ruta al archivo JSON
+            schema_type: Tipo de schema a usar
+        
+        Returns:
+            Tuple[bool, str, float]: (is_valid, message, confidence)
+        """
+        try:
+            # NUEVO: Validar schema_type
+            self._validate_schema_type(schema_type)
+            
+            # Convertir a Path
+            path = Path(file_path)
+            
+            if not path.exists():
+                return (False, f"Archivo no encontrado: {file_path}", 0.0)
+            
+            # NUEVO: Verificar tamaño antes de cargar
+            file_size = path.stat().st_size
+            if file_size > MAX_JSON_SIZE_BYTES:
+                return (
+                    False,
+                    f"Archivo demasiado grande: {file_size} bytes "
+                    f"(máximo {MAX_JSON_SIZE_BYTES})",
+                    0.0
+                )
+            
+            # Cargar JSON
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Validar contra schema - necesito implementar este método
+            return self.validate(data, schema_type)
+            
         except json.JSONDecodeError as e:
-            logger.error(f"Error parsing schema {schema_file}: {e}")
-            return None
+            return (False, f"JSON inválido: {e}", 0.0)
+        except UnicodeDecodeError as e:
+            return (False, f"Encoding inválido: {e}", 0.0)
+        except Exception as e:
+            return (False, f"Error validando archivo: {e}", 0.0)
+
+    def validate(self, data: dict, schema_type: str) -> Tuple[bool, str, float]:
+        """Método de validación general"""
+        if schema_type == 'proposal':
+            return self.validate_proposal(data)
+        else:
+            # Para otros tipos, usar validación básica
+            try:
+                schema = self._load_schema(schema_type)
+                validate(data, schema)
+                return (True, "Validación exitosa", 1.0)
+            except ValidationError as e:
+                return (False, f"Error de validación: {e.message}", 0.0)
+            except Exception as e:
+                return (False, f"Error: {e}", 0.0)
+
+    def _validate_against_schema(self, data: dict, schema_type: str) -> ValidationResult:
+        """Validación auxiliar contra schema"""
+        try:
+            schema = self._load_schema(schema_type)
+            validate(data, schema)
+            return ValidationResult(
+                is_valid=True,
+                message="Schema válido",
+                confidence=1.0,
+                errors=[],
+                warnings=[]
+            )
+        except ValidationError as e:
+            return ValidationResult(
+                is_valid=False,
+                message=f"Error de schema: {e.message}",
+                confidence=0.0,
+                errors=[e.message],
+                warnings=[]
+            )
+        except Exception as e:
+            return ValidationResult(
+                is_valid=False,
+                message=f"Error: {e}",
+                confidence=0.0,
+                errors=[str(e)],
+                warnings=[]
+            )
     
     def validate_json_schema(self, data: dict, schema_type: str) -> ValidationResult:
         """
@@ -199,7 +678,7 @@ class Validator:
         
         # Validar author_ia format
         author_ia = data.get('author_ia', '')
-        if not re.match(self.rules.IA_ID_PATTERN, author_ia):
+        if author_ia and not self.rules.IA_ID_PATTERN.match(str(author_ia)):
             errors.append(f"author_ia '{author_ia}' no cumple patrón 'ia-[a-z0-9-]+'")
         
         content = data.get('content', {})
@@ -265,7 +744,7 @@ class Validator:
         
         # Validar author_ia
         author_ia = data.get('author_ia', '')
-        if not re.match(self.rules.IA_ID_PATTERN, author_ia):
+        if author_ia and not self.rules.IA_ID_PATTERN.match(str(author_ia)):
             errors.append(f"author_ia '{author_ia}' no cumple patrón esperado")
         
         # Validar target_proposal

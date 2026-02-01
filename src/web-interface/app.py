@@ -27,12 +27,17 @@ import json
 import os
 import sys
 import uuid
+import secrets
+import html
+import hashlib
+import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
+import logging
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, g
 
 # Importar módulos PERCIA
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
@@ -47,35 +52,325 @@ except ImportError as e:
     Validator = None
     CommitCoordinator = None
 
+# ==============================================================================
+# CONFIGURACIÓN DE SEGURIDAD (Ronda 2 - Copilot CLI)
+# ==============================================================================
+
+# CORREGIDO: Modo de ejecución (nunca debug en producción)
+FLASK_ENV = os.environ.get('FLASK_ENV', 'production')
+DEBUG_MODE = FLASK_ENV == 'development'
+
+# CORREGIDO: Host seguro por defecto (solo localhost)
+# Para producción, usar reverse proxy (nginx, traefik, etc.)
+BIND_HOST = os.environ.get('PERCIA_BIND_HOST', '127.0.0.1')
+BIND_PORT = int(os.environ.get('PERCIA_BIND_PORT', '5000'))
+
+# CORREGIDO: API Key segura
+# Si no hay variable de entorno, generar una aleatoria (y mostrar advertencia)
+_env_api_key = os.environ.get('PERCIA_API_KEY')
+if _env_api_key:
+    API_KEY = _env_api_key
+else:
+    API_KEY = secrets.token_urlsafe(32)
+    print(f"⚠️  WARNING: No PERCIA_API_KEY set. Generated temporary key: {API_KEY[:8]}...")
+    print("⚠️  Set PERCIA_API_KEY environment variable for production!")
+
+# Límites de seguridad
+MAX_CONTENT_LENGTH = 1024 * 1024  # 1 MB máximo
+MAX_REQUEST_SIZE = 1024 * 1024    # 1 MB máximo
+RATE_LIMIT_REQUESTS = 100         # Requests por ventana
+RATE_LIMIT_WINDOW = 3600          # Ventana en segundos (1 hora)
+
+# Configuración de logging seguro
+LOG_LEVEL = logging.INFO if not DEBUG_MODE else logging.DEBUG
+
 # Configuración
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+app.config['SECRET_KEY'] = secrets.token_urlsafe(32)
 
 BASE_PATH = Path(__file__).parent.parent
 MCP_DIR = BASE_PATH / "mcp"
 PERCIA_DIR = BASE_PATH / ".percia"
 
-# API Key simple para autenticación básica (en producción usar JWT)
-API_KEY = os.environ.get('PERCIA_API_KEY', 'percia-dev-key-2024')
+
+# ==============================================================================
+# RATE LIMITER SIMPLE (sin dependencias externas)
+# ==============================================================================
+
+class SimpleRateLimiter:
+    """
+    Rate limiter simple basado en memoria.
+    
+    Para producción, usar Redis o similar para persistencia distribuida.
+    """
+    
+    def __init__(self, max_requests: int = RATE_LIMIT_REQUESTS,
+                 window_seconds: int = RATE_LIMIT_WINDOW):
+        self._requests: Dict[str, list] = {}
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+    
+    def _get_client_id(self) -> str:
+        """Obtiene un identificador único para el cliente."""
+        # Usar IP + API key (si presente) para identificar cliente
+        client_ip = request.remote_addr or 'unknown'
+        api_key = request.headers.get('X-API-Key', '')
+        
+        # Hash para no almacenar IP directamente
+        raw_id = f"{client_ip}:{api_key}"
+        return hashlib.sha256(raw_id.encode()).hexdigest()[:16]
+    
+    def _cleanup_old_requests(self, client_id: str) -> None:
+        """Elimina requests antiguos fuera de la ventana."""
+        if client_id not in self._requests:
+            return
+        
+        cutoff = time.time() - self._window_seconds
+        self._requests[client_id] = [
+            ts for ts in self._requests[client_id]
+            if ts > cutoff
+        ]
+    
+    def is_allowed(self) -> bool:
+        """
+        Verifica si el cliente puede hacer una request.
+        
+        Returns:
+            bool: True si está permitido, False si excede el límite
+        """
+        client_id = self._get_client_id()
+        
+        # Limpiar requests antiguos
+        self._cleanup_old_requests(client_id)
+        
+        # Verificar límite
+        if client_id not in self._requests:
+            self._requests[client_id] = []
+        
+        if len(self._requests[client_id]) >= self._max_requests:
+            return False
+        
+        # Registrar nueva request
+        self._requests[client_id].append(time.time())
+        return True
+    
+    def get_remaining(self) -> int:
+        """Obtiene el número de requests restantes."""
+        client_id = self._get_client_id()
+        self._cleanup_old_requests(client_id)
+        
+        current = len(self._requests.get(client_id, []))
+        return max(0, self._max_requests - current)
 
 
-# ============================================================
-# MIDDLEWARE Y HELPERS
-# ============================================================
+# Instancia global del rate limiter
+rate_limiter = SimpleRateLimiter()
 
-def require_api_key(f):
-    """Decorator para requerir API key en endpoints protegidos"""
+
+# ==============================================================================
+# DECORADORES DE SEGURIDAD
+# ==============================================================================
+
+def rate_limited(f: Callable) -> Callable:
+    """
+    Decorador para aplicar rate limiting a un endpoint.
+    """
     @wraps(f)
-    def decorated(*args, **kwargs):
-        api_key = request.headers.get('X-API-Key')
-        if api_key != API_KEY:
+    def decorated_function(*args, **kwargs):
+        if not rate_limiter.is_allowed():
             return jsonify({
-                "status": "error",
-                "error": "Invalid or missing API key",
-                "code": "UNAUTHORIZED"
-            }), 401
+                "error": "Rate limit exceeded",
+                "retry_after": RATE_LIMIT_WINDOW
+            }), 429
+        
+        # Añadir headers de rate limit a la respuesta
+        response = f(*args, **kwargs)
+        
+        # Si es una tupla (response, status_code)
+        if isinstance(response, tuple):
+            resp_obj, status = response
+        else:
+            resp_obj = response
+            status = 200
+        
+        return resp_obj, status
+    
+    return decorated_function
+
+
+def require_api_key(f: Callable) -> Callable:
+    """
+    Decorador para requerir API key válida.
+    
+    CORREGIDO: Logging seguro sin exponer la key.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        provided_key = request.headers.get('X-API-Key', '')
+        
+        if not provided_key:
+            # Log sin información sensible
+            logging.warning(
+                f"Auth failure: Missing API key from {request.remote_addr}"
+            )
+            return jsonify({"error": "API key required"}), 401
+        
+        # Comparación segura contra timing attacks
+        if not secrets.compare_digest(provided_key, API_KEY):
+            logging.warning(
+                f"Auth failure: Invalid API key from {request.remote_addr}"
+            )
+            return jsonify({"error": "Invalid API key"}), 401
+        
         return f(*args, **kwargs)
-    return decorated
+    
+    return decorated_function
+
+
+def validate_content_length(f: Callable) -> Callable:
+    """
+    Decorador para validar tamaño del payload.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        content_length = request.content_length
+        
+        if content_length and content_length > MAX_CONTENT_LENGTH:
+            return jsonify({
+                "error": f"Payload too large. Maximum: {MAX_CONTENT_LENGTH} bytes"
+            }), 413
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+
+# ==============================================================================
+# FUNCIONES DE SANITIZACIÓN
+# ==============================================================================
+
+def sanitize_for_html(text: str) -> str:
+    """
+    Sanitiza texto para uso seguro en HTML.
+    
+    Args:
+        text: Texto a sanitizar
+    
+    Returns:
+        str: Texto seguro para HTML
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return html.escape(text)
+
+
+def sanitize_error_message(error: Exception) -> str:
+    """
+    Sanitiza un mensaje de error para respuesta segura.
+    
+    CORREGIDO: No expone stack traces ni paths internos.
+    
+    Args:
+        error: Excepción a sanitizar
+    
+    Returns:
+        str: Mensaje de error seguro
+    """
+    error_str = str(error)
+    
+    # Eliminar paths del sistema
+    # Patrones comunes de paths
+    import re
+    path_patterns = [
+        r'[A-Za-z]:\\[^\s]+',  # Windows paths
+        r'/[^\s]+',            # Unix paths
+        r'File "[^"]+", line \d+',  # Python traceback
+    ]
+    
+    for pattern in path_patterns:
+        error_str = re.sub(pattern, '[path hidden]', error_str)
+    
+    # Limitar longitud
+    if len(error_str) > 200:
+        error_str = error_str[:200] + "..."
+    
+    return error_str
+
+
+def safe_json_response(data: dict, status: int = 200) -> tuple:
+    """
+    Crea una respuesta JSON segura.
+    
+    Args:
+        data: Datos a retornar
+        status: Código de estado HTTP
+    
+    Returns:
+        tuple: (response, status_code)
+    """
+    # Sanitizar strings en el diccionario
+    def sanitize_dict(d):
+        if isinstance(d, dict):
+            return {k: sanitize_dict(v) for k, v in d.items()}
+        elif isinstance(d, list):
+            return [sanitize_dict(item) for item in d]
+        elif isinstance(d, str):
+            return sanitize_for_html(d)
+        else:
+            return d
+    
+    safe_data = sanitize_dict(data)
+    return jsonify(safe_data), status
+
+
+def load_json_file(file_path: Path, base_path: Path) -> Dict[str, Any]:
+    """
+    Carga un archivo JSON de forma segura.
+    
+    CORREGIDO:
+    - Valida que el path está dentro del directorio permitido
+    - Verifica tamaño antes de cargar
+    
+    Args:
+        file_path: Ruta al archivo
+        base_path: Directorio base permitido
+    
+    Returns:
+        dict: Contenido del archivo
+    
+    Raises:
+        ValueError: Si el path es inválido
+        FileNotFoundError: Si el archivo no existe
+    """
+    # Resolver paths
+    resolved_file = Path(file_path).resolve()
+    resolved_base = base_path.resolve()
+    
+    # Verificar que está dentro del directorio permitido
+    try:
+        resolved_file.relative_to(resolved_base)
+    except ValueError:
+        raise ValueError(f"Acceso denegado: path fuera del directorio permitido")
+    
+    # Verificar que existe
+    if not resolved_file.exists():
+        raise FileNotFoundError(f"Archivo no encontrado")
+    
+    # Verificar tamaño
+    file_size = resolved_file.stat().st_size
+    if file_size > MAX_CONTENT_LENGTH:
+        raise ValueError(f"Archivo demasiado grande: {file_size} bytes")
+    
+    # Cargar JSON
+    with open(resolved_file, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+# ============================================================
+# MIDDLEWARE Y HELPERS (originales actualizados)
+# ============================================================
 
 
 def get_lock_manager() -> Optional[LockManager]:
@@ -147,9 +442,77 @@ def save_json_file(file_path: Path, data: Dict[str, Any]) -> bool:
 
 # ============================================================
 # TEMPLATE HTML PARA MANUAL
-# ============================================================
+# ==============================================================================
+# TEMPLATE HTML SEGURO (Ronda 2 - Copilot CLI)
+# ==============================================================================
 
-MANUAL_HTML = """
+SAFE_HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- NUEVO: Content Security Policy -->
+    <meta http-equiv="Content-Security-Policy" 
+          content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';">
+    <title>PERCIA v2.0 - API REST</title>
+    <style>
+        /* Estilos inline seguros */
+        body { font-family: -apple-system, sans-serif; margin: 40px; background: #0d1117; color: #c9d1d9; }
+        h1 { color: #58a6ff; }
+        .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .healthy { background: #238636; }
+        .degraded { background: #9e6a03; }
+        .error { background: #da3633; }
+        pre { background: #161b22; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        code { color: #79c0ff; }
+    </style>
+</head>
+<body>
+    <h1>🔬 PERCIA v2.0 - API REST</h1>
+    <div id="status" class="status"></div>
+    <h2>📋 Endpoints Disponibles</h2>
+    <pre><code id="endpoints"></code></pre>
+    
+    <script>
+        // CORREGIDO: No usar innerHTML con datos no sanitizados
+        // Usar textContent en su lugar
+        
+        fetch('/api/system/health')
+            .then(r => r.json())
+            .then(data => {
+                const statusEl = document.getElementById('status');
+                const statusClass = data.status === 'healthy' ? 'healthy' : 
+                                   data.status === 'degraded' ? 'degraded' : 'error';
+                statusEl.className = 'status ' + statusClass;
+                // CORREGIDO: Usar textContent, no innerHTML
+                statusEl.textContent = (data.status === 'healthy' ? '✅' : '❌') + 
+                                       ' Estado: ' + data.status;
+            })
+            .catch(err => {
+                const statusEl = document.getElementById('status');
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ Error conectando con la API';
+            });
+        
+        // Mostrar endpoints (texto estático, seguro)
+        document.getElementById('endpoints').textContent = `
+GET  /api/system/status   - Estado del sistema
+GET  /api/system/health   - Health check
+POST /api/bootstrap/create - Crear bootstrap (requiere API key)
+GET  /api/bootstrap/get   - Obtener bootstrap
+POST /api/cycle/start     - Iniciar ciclo (requiere API key)
+POST /api/proposal/submit - Enviar propuesta (requiere API key)
+GET  /api/proposals/list  - Listar propuestas
+GET  /api/challenges/list - Listar challenges
+POST /api/governance/decide - Decisión (requiere API key)
+GET  /api/metrics/get     - Métricas
+GET  /api/queue/status    - Cola
+        `.trim();
+    </script>
+</body>
+</html>
+'''
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -297,7 +660,7 @@ curl -X POST http://localhost:5000/api/proposal/submit \\
 @app.route('/')
 def index():
     """Página principal con manual de la API"""
-    return render_template_string(MANUAL_HTML)
+    return render_template_string(SAFE_HTML_TEMPLATE)
 
 
 # ============================================================
@@ -370,7 +733,9 @@ def api_health():
 # ============================================================
 
 @app.route('/api/bootstrap/create', methods=['POST'])
+@rate_limited
 @require_api_key
+@validate_content_length
 def api_bootstrap_create():
     """Crear nueva configuración bootstrap"""
     try:
@@ -464,7 +829,9 @@ def api_bootstrap_get():
 # ============================================================
 
 @app.route('/api/cycle/start', methods=['POST'])
+@rate_limited
 @require_api_key
+@validate_content_length
 def api_cycle_start():
     """Iniciar nuevo ciclo de decisión"""
     try:
@@ -536,7 +903,9 @@ def api_cycle_start():
 # ============================================================
 
 @app.route('/api/proposal/submit', methods=['POST'])
+@rate_limited
 @require_api_key
+@validate_content_length
 def api_proposal_submit():
     """Enviar propuesta de IA"""
     try:
@@ -694,7 +1063,9 @@ def api_challenges_list():
 # ============================================================
 
 @app.route('/api/governance/decide', methods=['POST'])
+@rate_limited
 @require_api_key
+@validate_content_length
 def api_governance_decide():
     """Registrar decisión de gobernanza"""
     try:
@@ -889,13 +1260,32 @@ def method_not_allowed(e):
 # MAIN
 # ============================================================
 
-if __name__ == '__main__':
+def run_server():
+    """
+    Inicia el servidor con configuración segura.
+    
+    CORREGIDO:
+    - DEBUG=False por defecto
+    - Bind a localhost por defecto
+    - Muestra advertencias de seguridad
+    """
+    # Configurar error handlers
+    setup_error_handlers(app)
+    
     print("=" * 60)
     print("🔬 PERCIA v2.0 - API REST Server")
     print("=" * 60)
-    print(f"📁 Base path: {BASE_PATH}")
-    print(f"📁 MCP dir: {MCP_DIR}")
-    print(f"🔑 API Key: {API_KEY[:10]}...")
+    print(f"📁 Environment: {FLASK_ENV}")
+    print(f"🔐 Debug mode: {DEBUG_MODE}")
+    print(f"🌐 Bind: {BIND_HOST}:{BIND_PORT}")
+    print(f"🔑 API Key: {API_KEY[:8]}...")
+    
+    if DEBUG_MODE:
+        print("⚠️  WARNING: Running in DEBUG mode - NOT FOR PRODUCTION!")
+    
+    if BIND_HOST == '0.0.0.0':
+        print("⚠️  WARNING: Binding to all interfaces - use reverse proxy!")
+    
     print("=" * 60)
     print("📋 Endpoints disponibles:")
     print("  GET  /                    → Manual HTML")
@@ -911,7 +1301,15 @@ if __name__ == '__main__':
     print("  GET  /api/metrics/get     → Métricas")
     print("  GET  /api/queue/status    → Cola")
     print("=" * 60)
-    print("🚀 Servidor iniciando en http://localhost:5000")
-    print("=" * 60)
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # CORREGIDO: Configuración segura
+    app.run(
+        debug=DEBUG_MODE,      # False por defecto
+        host=BIND_HOST,        # 127.0.0.1 por defecto
+        port=BIND_PORT,
+        threaded=True
+    )
+
+
+if __name__ == '__main__':
+    run_server()

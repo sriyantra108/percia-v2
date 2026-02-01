@@ -25,6 +25,7 @@ import time
 import os
 import sys
 import uuid
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
@@ -45,6 +46,21 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('PERCIA.LockManager')
+
+# ==============================================================================
+# NUEVAS CONSTANTES DE SEGURIDAD (Ronda 2 - Copilot CLI)
+# ==============================================================================
+
+# Límites de seguridad para validación de inputs
+MAX_IA_ID_LENGTH = 64
+MAX_OPERATION_TYPE_LENGTH = 32
+MAX_FILE_PATH_LENGTH = 512
+VALID_IA_ID_PATTERN = r'^[a-zA-Z0-9_-]+$'
+VALID_OPERATION_TYPES = {'read', 'write', 'commit', 'validate', 'bootstrap', 'cycle', 'proposal', 'governance'}
+
+# Timeout mejorado para watchdog (evita false positives)
+WATCHDOG_CHECK_INTERVAL = 5.0  # Aumentado de 1.0s a 5.0s
+WATCHDOG_GRACE_PERIOD = 10.0   # Período de gracia antes de liberar locks
 
 
 @dataclass
@@ -131,6 +147,53 @@ class LockManager:
             self._save_queue([])
         
         logger.info(f"LockManager inicializado en {self.base_path}")
+    
+    def _validate_input(self, ia_id: str, operation_type: Optional[str] = None, 
+                        file_path: Optional[str] = None) -> None:
+        """
+        Valida todos los inputs para prevenir injection y path traversal.
+        
+        Raises:
+            ValueError: Si algún input es inválido
+        """
+        # Validar ia_id
+        if not ia_id or not isinstance(ia_id, str):
+            raise ValueError("ia_id debe ser un string no vacío")
+        
+        if len(ia_id) > MAX_IA_ID_LENGTH:
+            raise ValueError(f"ia_id excede longitud máxima de {MAX_IA_ID_LENGTH}")
+        
+        if not re.match(VALID_IA_ID_PATTERN, ia_id):
+            raise ValueError(f"ia_id contiene caracteres inválidos: {ia_id}")
+        
+        # Validar operation_type si se proporciona
+        if operation_type is not None:
+            if not isinstance(operation_type, str):
+                raise ValueError("operation_type debe ser un string")
+            
+            if len(operation_type) > MAX_OPERATION_TYPE_LENGTH:
+                raise ValueError(f"operation_type excede longitud máxima")
+            
+            if operation_type.lower() not in VALID_OPERATION_TYPES:
+                raise ValueError(f"operation_type inválido: {operation_type}")
+        
+        # Validar file_path si se proporciona
+        if file_path is not None:
+            if not isinstance(file_path, str):
+                raise ValueError("file_path debe ser un string")
+            
+            if len(file_path) > MAX_FILE_PATH_LENGTH:
+                raise ValueError(f"file_path excede longitud máxima")
+            
+            # Prevenir path traversal
+            if '..' in file_path or file_path.startswith('/') or file_path.startswith('\\'):
+                raise ValueError(f"file_path contiene path traversal: {file_path}")
+            
+            # Prevenir caracteres peligrosos
+            dangerous_chars = ['<', '>', '|', '&', ';', '$', '`', '\n', '\r', '\0']
+            for char in dangerous_chars:
+                if char in file_path:
+                    raise ValueError(f"file_path contiene carácter peligroso: {char}")
 
     @contextmanager
     def _mutex(self, timeout: float = 10.0):
@@ -540,59 +603,162 @@ class LockManager:
         finally:
             self.release_global_lock()
     
-    def enqueue_operation(
-        self, 
-        ia_id: str, 
-        operation_type: str, 
-        file_path: str,
-        priority: int = 5
-    ) -> str:
-        """Añade operación a la cola FIFO"""
-        queue = self._load_queue()
+    def enqueue_operation(self, ia_id: str, operation_type: str, 
+                          file_path: Optional[str] = None,
+                          metadata: Optional[dict] = None) -> str:
+        """
+        Añade una operación a la cola de forma thread-safe.
         
-        queue_item = QueueItem(
-            queue_id=f"q-{uuid.uuid4().hex[:12]}",
-            ia_id=ia_id,
-            operation_type=operation_type,
-            file_path=file_path,
-            priority=priority,
-            enqueued_at=datetime.now().isoformat(),
-            status="pending"
-        )
+        CORREGIDO: Ahora usa mutex para garantizar atomicidad.
         
-        queue.append(queue_item)
-        queue.sort(key=lambda x: (x.priority, x.enqueued_at))
-        self._save_queue(queue)
+        Args:
+            ia_id: Identificador de la IA
+            operation_type: Tipo de operación
+            file_path: Ruta del archivo (opcional)
+            metadata: Metadatos adicionales (opcional)
         
-        logger.info(f"Operación {queue_item.queue_id} añadida a la cola")
-        return queue_item.queue_id
-    
-    def dequeue_operation(self) -> Optional[QueueItem]:
-        """Obtiene y procesa la siguiente operación de la cola"""
-        queue = self._load_queue()
+        Returns:
+            str: ID único de la operación encolada
         
-        for item in queue:
-            if item.status == "pending":
-                item.status = "processing"
+        Raises:
+            ValueError: Si los inputs son inválidos
+        """
+        # NUEVO: Validación de inputs
+        self._validate_input(ia_id, operation_type, file_path)
+        
+        # CORREGIDO: Usar mutex para toda la operación
+        with self._mutex():
+            try:
+                # Cargar cola actual
+                queue = self._load_queue()
+                
+                # Generar ID único para la operación
+                operation_id = f"op-{uuid.uuid4().hex[:12]}-{int(time.time())}"
+                
+                # Crear entrada de operación
+                queue_item = QueueItem(
+                    queue_id=operation_id,
+                    ia_id=ia_id,
+                    operation_type=operation_type,
+                    file_path=file_path or '',
+                    priority=5,
+                    enqueued_at=datetime.now().isoformat(),
+                    status='pending'
+                )
+                
+                # Añadir a la cola
+                queue.append(queue_item)
+                queue.sort(key=lambda x: (x.priority, x.enqueued_at))
+                
+                # Guardar cola actualizada
                 self._save_queue(queue)
-                logger.info(f"Procesando operación {item.queue_id}")
-                return item
-        
-        return None
+                
+                logger.info(f"Operación encolada: {operation_id} por {ia_id}")
+                return operation_id
+                
+            except Exception as e:
+                logger.error(f"Error encolando operación: {e}")
+                raise
     
-    def complete_operation(self, queue_id: str, success: bool = True) -> bool:
-        """Marca una operación como completada"""
-        queue = self._load_queue()
+    def dequeue_operation(self, ia_id: str) -> Optional[dict]:
+        """
+        Obtiene la siguiente operación pendiente de forma thread-safe.
         
-        for item in queue:
-            if item.queue_id == queue_id:
-                item.status = "completed" if success else "failed"
-                self._save_queue(queue)
-                logger.info(f"Operación {queue_id} marcada como {item.status}")
-                return True
+        CORREGIDO: Ahora usa mutex para prevenir race conditions donde
+        múltiples procesos obtienen la misma operación.
         
-        logger.warning(f"Operación {queue_id} no encontrada")
-        return False
+        Args:
+            ia_id: Identificador de la IA que procesa
+        
+        Returns:
+            dict: Operación a procesar o None si no hay pendientes
+        """
+        # NUEVO: Validación de inputs
+        self._validate_input(ia_id)
+        
+        # CORREGIDO: Usar mutex para toda la operación read-modify-write
+        with self._mutex():
+            try:
+                queue = self._load_queue()
+                
+                # Buscar primera operación pendiente
+                for i, item in enumerate(queue):
+                    if item.status == "pending":
+                        # ATÓMICO: Marcar como procesando Y asignar procesador
+                        queue[i].status = "processing"
+                        
+                        # Guardar inmediatamente (dentro del mutex)
+                        self._save_queue(queue)
+                        
+                        logger.info(
+                            f"Operación {item.queue_id} asignada a {ia_id}"
+                        )
+                        return item.to_dict()  # Retornar copia para seguridad
+                
+                return None  # No hay operaciones pendientes
+                
+            except Exception as e:
+                logger.error(f"Error en dequeue: {e}")
+                return None
+    
+    def complete_operation(self, operation_id: str, success: bool = True,
+                           result: Optional[dict] = None,
+                           error: Optional[str] = None) -> bool:
+        """
+        Marca una operación como completada de forma thread-safe.
+        
+        CORREGIDO: Ahora usa mutex para prevenir race conditions.
+        
+        Args:
+            operation_id: ID de la operación a completar
+            success: Si la operación fue exitosa
+            result: Resultado de la operación (opcional)
+            error: Mensaje de error si falló (opcional)
+        
+        Returns:
+            bool: True si se actualizó correctamente
+        """
+        # Validación básica del operation_id
+        if not operation_id or not isinstance(operation_id, str):
+            raise ValueError("operation_id debe ser un string no vacío")
+        
+        if len(operation_id) > 128:
+            raise ValueError("operation_id demasiado largo")
+        
+        # CORREGIDO: Usar mutex para toda la operación
+        with self._mutex():
+            try:
+                queue = self._load_queue()
+                
+                # Buscar la operación
+                for i, item in enumerate(queue):
+                    if item.queue_id == operation_id:
+                        # Verificar que está en estado 'processing'
+                        if item.status != "processing":
+                            logger.warning(
+                                f"Operación {operation_id} no está en processing, "
+                                f"estado actual: {item.status}"
+                            )
+                            return False
+                        
+                        # Actualizar estado
+                        queue[i].status = "completed" if success else "failed"
+                        
+                        # Guardar cola actualizada
+                        self._save_queue(queue)
+                        
+                        logger.info(
+                            f"Operación {operation_id} completada: "
+                            f"{'éxito' if success else 'fallo'}"
+                        )
+                        return True
+                
+                logger.warning(f"Operación {operation_id} no encontrada")
+                return False
+                
+            except Exception as e:
+                logger.error(f"Error completando operación: {e}")
+                return False
     
     def get_queue_status(self) -> Dict[str, Any]:
         """Obtiene estado actual de la cola"""
@@ -644,33 +810,58 @@ class LockManager:
         logger.info("Watchdog detenido")
     
     def _watchdog_loop(self) -> None:
-        """Loop del watchdog para limpiar locks expirados / huérfanos (bajo mutex)."""
+        """
+        Verifica y libera locks huérfanos de forma segura.
+        
+        CORREGIDO:
+        - Timeout aumentado a 5.0s para evitar false positives
+        - Período de gracia antes de liberar locks
+        - Verificación más robusta del estado del proceso
+        """
         while self._watchdog_running:
             try:
-                # Intento corto para no bloquear el sistema si hay contención
-                with self._mutex(timeout=1.0):
+                time.sleep(WATCHDOG_CHECK_INTERVAL)  # Usar constante configurable
+                
+                # Usar mutex para verificación segura
+                with self._mutex():
                     current_lock = self._read_lock()
-
-                    if current_lock:
-                        if current_lock.is_expired():
-                            logger.warning(
-                                f"Watchdog: Lock expirado de {current_lock.ia_id}"
+                    if not current_lock:
+                        continue
+                    
+                    # Verificar si el lock ha expirado
+                    if current_lock.is_expired():
+                        # NUEVO: Período de gracia antes de liberar
+                        expired_time = datetime.now() - datetime.fromisoformat(current_lock.expires_at)
+                        if expired_time.total_seconds() < WATCHDOG_GRACE_PERIOD:
+                            continue
+                        
+                        # Verificar si el proceso sigue vivo
+                        if self._is_process_alive(current_lock.pid):
+                            # El proceso sigue vivo, puede que esté renovando
+                            logger.debug(
+                                f"Lock held by active process {current_lock.pid}, "
+                                f"expired: {expired_time.total_seconds():.1f}s ago"
                             )
-                            self._log_lock_event("watchdog_expired", current_lock)
-                            self._force_release_lock()
-
-                        elif not self._is_process_alive(current_lock.pid):
-                            logger.warning(
-                                f"Watchdog: Proceso {current_lock.pid} muerto"
-                            )
-                            self._log_lock_event("watchdog_orphan", current_lock)
-                            self._force_release_lock()
-
+                            continue
+                        
+                        # El lock está huérfano, liberar de forma segura
+                        logger.warning(
+                            f"Liberando lock huérfano de {current_lock.ia_id} "
+                            f"(PID: {current_lock.pid}, expired: {expired_time.total_seconds():.1f}s ago)"
+                        )
+                        self._log_lock_event("watchdog_expired", current_lock)
+                        self._force_release_lock()
+                    
+                    elif not self._is_process_alive(current_lock.pid):
+                        logger.warning(
+                            f"Liberando lock de proceso muerto {current_lock.pid}"
+                        )
+                        self._log_lock_event("watchdog_orphan", current_lock)
+                        self._force_release_lock()
+                        
             except Exception as e:
-                # Si no se pudo adquirir mutex o cualquier error, se registra y continúa
                 logger.error(f"Error en watchdog: {e}")
-
-            time.sleep(self.WATCHDOG_INTERVAL_SECONDS)
+                # No propagar excepción, el watchdog debe continuar
     
     def submit_operation(self, ia_id: str, operation_type: str, file_path: str = None) -> Dict[str, Any]:
         """Procesa envío de propuesta o challenge con lock y cola"""
@@ -679,8 +870,7 @@ class LockManager:
             queue_id = self.enqueue_operation(
                 ia_id=ia_id,
                 operation_type=operation_type,
-                file_path=file_path or "",
-                priority=5
+                file_path=file_path
             )
             
             with self.lock_context(ia_id, operation_type):
