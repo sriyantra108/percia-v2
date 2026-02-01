@@ -1,0 +1,14 @@
+# PERCIA v2.0 - Dependencias
+# Instalar con: pip install -r requirements.txt
+
+# Web framework
+Flask>=3.0.0
+
+# JSON Schema validation
+jsonschema>=4.21.0
+
+# Cross-platform file locking (requerido por parches GPT-4o)
+portalocker>=2.0.0
+
+# Cross-platform process verification (requerido por parche Mistral CRIT-003)
+psutil>=5.9.0
