@@ -1,26 +1,5 @@
-# PERCIA v2.0 - Dependencies (Security Patched Version)
-# =====================================================
-# Fecha: Febrero 2026
-# Versión: 2.0.0-security-patch
-
-# Core Flask
-Flask>=2.0.0,<3.0.0
-
-# Rate Limiting (PARCHE #5)
+# PERCIA v2.0 — Production Dependencies
+flask>=3.0.0
 flask-limiter>=3.0.0
-
-# Process monitoring (PARCHE #11)
-psutil>=5.9.0
-
-# Cross-platform file locking
-portalocker>=2.0.0
-
-# JSON Schema validation
-jsonschema>=4.0.0
-
-# Optional: Redis for production rate limiting
-# redis>=4.0.0
-
-# Development/Testing
-# pytest>=7.0.0
-# pytest-cov>=4.0.0
+psutil>=5.0.0
+waitress>=3.0.0
