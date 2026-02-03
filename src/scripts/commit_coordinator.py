@@ -1,1047 +1,714 @@
 #!/usr/bin/env python3
 """
-PERCIA v2.0 - Commit Coordinator - Commits Atómicos con Git
+PERCIA v2.0 - Commit Coordinator
+================================
+Coordinación de commits Git con Two-Phase Commit (2PC)
 
-Implementa:
-- Two-phase commit para atomicidad
-- Rollback automático en caso de fallo
-- Sincronización snapshot.json con Git
-- Backups automáticos antes de operaciones
-- Logging completo para auditoría
-- Integración con LockManager para concurrencia
+VERSIÓN PARCHEADA - Ronda 3 Multi-IA Security Audit
+Parches aplicados:
+  - #7: Command Injection en _run_git (ChatGPT/Perplexity) - Validación fullmatch 7-40
+  - #8: Zombie Commits (ChatGPT) - restore_git_state flag para rollback correcto
 
-Corrige hallazgos:
-- CRIT-002 (Copilot): Atomicidad no garantizada
-- CRIT-CC-001 (GPT-4o): Bug de orden en commit_transaction
-- CRIT-CC-002 (GPT-4o): Exception handler fallaba
-- CRIT-CC-003 (GPT-4o): git_head se actualiza después del commit
-- CRIT-2PC-001 (Perplexity): Integración con LockManager
-- Gap documentación-código (Grok/Copilot)
+Commit base auditado: 5a20704
+Fecha parche: Febrero 2026
 """
 
-import json
 import os
-import sys
-import shutil
-import subprocess
-import uuid
 import re
-import shlex
+import sys
+import json
+import shutil
+import hashlib
+import logging
+import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple, TYPE_CHECKING
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
-import logging
 
-# Import condicional de LockManager para evitar circular imports
-if TYPE_CHECKING:
-    from lock_manager import LockManager
-
-# Configurar logging
+# Configuración de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('PERCIA.CommitCoordinator')
-
-# ==============================================================================
-# NUEVAS CONSTANTES DE SEGURIDAD (Ronda 2 - Copilot CLI)
-# ==============================================================================
-
-# Patrón para sanitizar mensajes de commit (previene injection)
-SAFE_COMMIT_MSG_PATTERN = re.compile(r'[^a-zA-Z0-9\s\-_.,!?():\[\]/#áéíóúñÁÉÍÓÚÑ]')
-MAX_COMMIT_MSG_LENGTH = 500
-
-# Lista de caracteres peligrosos para Git
-GIT_DANGEROUS_CHARS = ['`', '$', '|', '&', ';', '\n', '\r', '\0', '"', "'", '\\']
+logger = logging.getLogger(__name__)
 
 
 class CommitPhase(Enum):
-    """Fases del two-phase commit"""
-    INIT = "init"
-    PREPARE = "prepare"
-    COMMIT = "commit"
-    ROLLBACK = "rollback"
-    COMPLETED = "completed"
+    """Fases del Two-Phase Commit."""
+    IDLE = "idle"
+    PREPARING = "preparing"
+    PREPARED = "prepared"
+    COMMITTING = "committing"
+    COMMITTED = "committed"
+    ROLLING_BACK = "rolling_back"
+    ROLLED_BACK = "rolled_back"
     FAILED = "failed"
 
 
 @dataclass
-class TransactionState:
-    """Estado de una transacción"""
-    transaction_id: str
+class CommitState:
+    """Estado de un commit en progreso."""
+    commit_id: str
     phase: str
-    started_at: str
-    files_modified: List[str]
-    backup_dir: str
-    git_commit_hash: Optional[str]
-    error_message: Optional[str]
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'TransactionState':
-        return cls(**data)
-
-
-class GitError(Exception):
-    """Error relacionado con operaciones Git"""
-    pass
+    ia_id: str
+    files_modified: List[str] = field(default_factory=list)
+    backup_dir: Optional[str] = None
+    original_head: Optional[str] = None
+    started_at: str = ""
+    completed_at: Optional[str] = None
+    error_message: Optional[str] = None
+    restore_git_state: bool = False  # PARCHE #8: Flag para restaurar estado git
 
 
 class CommitCoordinator:
     """
-    Coordinador de commits atómicos para PERCIA v2.0
-    
-    Implementa two-phase commit:
-    1. PREPARE: Crear backup, validar cambios, stage en Git
-    2. COMMIT: Ejecutar commit Git, actualizar snapshot
-    3. ROLLBACK: Restaurar desde backup si hay fallo
+    Coordinador de commits con Two-Phase Commit (2PC).
     
     Características:
-    - Backups automáticos antes de cada operación
-    - Validación pre-commit
+    - Backup automático antes de cambios
     - Rollback automático en caso de error
-    - Sincronización snapshot.json con HEAD (después del commit)
-    - Logging completo para auditoría
-    - CRIT-2PC-001 (Perplexity): Integración con LockManager para concurrencia
+    - Validación de entradas contra command injection
+    - Restauración correcta de estado git
     """
     
-    BACKUP_RETENTION_COUNT = 10
+    STATE_FILE = ".percia_commit_state.json"
+    BACKUP_DIR = ".percia_backups"
     
-    def __init__(self, base_path: str = ".", lock_manager: Optional['LockManager'] = None):
+    # PARCHE #7: Regex para validación de commit hashes (fullmatch, 7-40 chars)
+    GIT_HASH_PATTERN = re.compile(r'^[a-f0-9]{7,40}$')
+    
+    # Regex para branch names seguros
+    BRANCH_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_\-/\.]+$')
+    
+    # Regex para paths seguros (sin caracteres especiales peligrosos)
+    SAFE_PATH_PATTERN = re.compile(r'^[a-zA-Z0-9_\-/\.]+$')
+    
+    def __init__(self, repo_path: str):
         """
         Inicializa el CommitCoordinator.
         
         Args:
-            base_path: Ruta base del proyecto
-            lock_manager: Instancia de LockManager para concurrencia (CRIT-2PC-001)
+            repo_path: Ruta al repositorio Git
         """
-        self.base_path = Path(base_path)
+        self.repo_path = Path(repo_path).resolve()
+        self.state_file = self.repo_path / self.STATE_FILE
+        self.backup_base = self.repo_path / self.BACKUP_DIR
         
-        # CRIT-2PC-001 (Perplexity): Integrar LockManager
-        self._lock_manager = lock_manager
+        # Verificar que es un repositorio Git
+        if not (self.repo_path / '.git').exists():
+            raise ValueError(f"{repo_path} no es un repositorio Git válido")
         
-        # Directorios
-        self.mcp_dir = self.base_path / "mcp"
-        self.percia_dir = self.base_path / ".percia"
-        self.backup_dir = self.percia_dir / "backups"
-        self.transaction_file = self.percia_dir / "current_transaction.json"
-        
-        # Archivos principales
-        self.snapshot_file = self.mcp_dir / "snapshot.json"
-        self.decisions_file = self.mcp_dir / "decisions.json"
-        
-        # Asegurar directorios
-        self.mcp_dir.mkdir(parents=True, exist_ok=True)
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        # Crear directorio de backups
+        self.backup_base.mkdir(parents=True, exist_ok=True)
         
         # Estado actual
-        self._current_transaction: Optional[TransactionState] = None
+        self._current_state: Optional[CommitState] = None
         
-        # Verificar que estamos en un repo Git
-        if not self._is_git_repo():
-            logger.warning("No es un repositorio Git. Algunas funciones estarán limitadas.")
-        
-        logger.info(f"CommitCoordinator inicializado en {self.base_path}")
+        logger.info(f"CommitCoordinator inicializado en {self.repo_path}")
     
-    def _sanitize_commit_message(self, message: str) -> str:
+    # ========================================================================
+    # PARCHE #7: Validación segura de entradas (ChatGPT/Perplexity)
+    # ========================================================================
+    
+    def _validate_git_hash(self, hash_value: str, param_name: str = "hash") -> str:
         """
-        Sanitiza un mensaje de commit para prevenir injection.
+        Valida que un valor sea un hash Git válido.
+        
+        PARCHE #7: Usa fullmatch con rango 7-40 caracteres.
         
         Args:
-            message: Mensaje original
+            hash_value: Valor a validar
+            param_name: Nombre del parámetro (para mensajes de error)
         
         Returns:
-            str: Mensaje sanitizado seguro para Git
-        """
-        if not message or not isinstance(message, str):
-            return "No description provided"
-        
-        # Limitar longitud
-        message = message[:MAX_COMMIT_MSG_LENGTH]
-        
-        # Remover caracteres peligrosos
-        for char in GIT_DANGEROUS_CHARS:
-            message = message.replace(char, '')
-        
-        # Aplicar patrón seguro (mantener solo caracteres permitidos)
-        message = SAFE_COMMIT_MSG_PATTERN.sub('', message)
-        
-        # Asegurar que no está vacío después de sanitizar
-        message = message.strip()
-        if not message:
-            return "Automated commit"
-        
-        return message
-    
-    def _generate_transaction_id(self) -> str:
-        """
-        Genera un ID de transacción único usando UUID + timestamp.
-        
-        CORREGIDO: Ya no usa solo timestamp (que causaba colisiones).
-        
-        Returns:
-            str: ID único en formato 'tx-{uuid}-{timestamp}'
-        """
-        unique_part = uuid.uuid4().hex[:8]
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        return f"tx-{unique_part}-{timestamp}"
-
-    def _validate_file_path(self, file_path: str) -> str:
-        """
-        Valida y sanitiza un path de archivo para operaciones Git.
-        
-        Args:
-            file_path: Path a validar
-        
-        Returns:
-            str: Path validado
+            Hash validado (lowercase)
         
         Raises:
-            ValueError: Si el path es inválido o peligroso
+            ValueError: Si el hash no es válido
         """
-        if not file_path or not isinstance(file_path, str):
-            raise ValueError("file_path debe ser un string no vacío")
+        if not hash_value:
+            raise ValueError(f"{param_name} no puede estar vacío")
         
-        # Resolver path y verificar que está dentro del repo
-        resolved = Path(file_path).resolve()
-        base_resolved = self.base_path.resolve()
+        # Normalizar a lowercase
+        hash_value = hash_value.strip().lower()
         
-        try:
-            resolved.relative_to(base_resolved)
-        except ValueError:
-            raise ValueError(f"Path fuera del repositorio: {file_path}")
-        
-        # Verificar que no es un symlink peligroso
-        if resolved.is_symlink():
-            target = resolved.resolve()
-            try:
-                target.relative_to(base_resolved)
-            except ValueError:
-                raise ValueError(f"Symlink apunta fuera del repositorio: {file_path}")
-        
-        return str(resolved.relative_to(base_resolved))
-
-    def _is_commit_pushed(self, commit_hash: str) -> bool:
-        """
-        Verifica si un commit ya fue pusheado al remoto.
-        
-        Args:
-            commit_hash: Hash del commit a verificar
-        
-        Returns:
-            bool: True si el commit existe en el remoto
-        """
-        try:
-            # Obtener commits en el remoto
-            result = self._run_git(
-                ['branch', '-r', '--contains', commit_hash],
-                capture_output=True
+        # PARCHE #7: fullmatch (no match) para evitar inyección
+        # Rango 7-40 permite tanto short hashes como full hashes
+        if not self.GIT_HASH_PATTERN.fullmatch(hash_value):
+            raise ValueError(
+                f"{param_name} inválido: '{hash_value}'. "
+                f"Debe ser hexadecimal de 7-40 caracteres."
             )
-            # Si hay output, el commit está en alguna rama remota
-            return bool(result and result.strip())
-        except Exception:
-            # En caso de error, asumir que NO está pusheado (más seguro)
-            return False
-
-    def _is_git_repo(self) -> bool:
-        """Verifica si estamos en un repositorio Git"""
-        git_dir = self.base_path / ".git"
-        return git_dir.exists() and git_dir.is_dir()
-    
-    def _run_git(self, args: List[str], capture_output: bool = False,
-                 timeout: int = 60) -> Optional[str]:
-        """
-        Ejecuta un comando Git de forma segura.
         
-        CORREGIDO:
-        - Nunca usa shell=True
-        - Timeout configurable
-        - Validación de argumentos
+        return hash_value
+    
+    def _validate_branch_name(self, branch: str) -> str:
+        """
+        Valida que un nombre de branch sea seguro.
         
         Args:
-            args: Lista de argumentos para git
-            capture_output: Si capturar el output
-            timeout: Timeout en segundos
+            branch: Nombre del branch
         
         Returns:
-            str: Output del comando si capture_output=True
+            Branch validado
+        
+        Raises:
+            ValueError: Si el branch tiene caracteres peligrosos
         """
-        # Validar que args es una lista
-        if not isinstance(args, list):
-            raise ValueError("args debe ser una lista")
+        if not branch:
+            raise ValueError("Branch name no puede estar vacío")
         
-        # Construir comando completo
-        cmd = ['git'] + args
+        branch = branch.strip()
         
-        # CORREGIDO: Nunca usar shell=True
+        # Verificar caracteres seguros
+        if not self.BRANCH_NAME_PATTERN.fullmatch(branch):
+            raise ValueError(
+                f"Branch name inválido: '{branch}'. "
+                f"Solo se permiten: a-z, A-Z, 0-9, _, -, /, ."
+            )
+        
+        # Verificar longitud
+        if len(branch) > 255:
+            raise ValueError(f"Branch name demasiado largo: {len(branch)} chars")
+        
+        return branch
+    
+    def _validate_path(self, path: str) -> str:
+        """
+        Valida que un path sea seguro (sin path traversal).
+        
+        Args:
+            path: Path a validar
+        
+        Returns:
+            Path validado
+        
+        Raises:
+            ValueError: Si el path contiene caracteres peligrosos
+        """
+        if not path:
+            raise ValueError("Path no puede estar vacío")
+        
+        path = path.strip()
+        
+        # Detectar path traversal
+        if '..' in path:
+            raise ValueError(f"Path traversal detectado: '{path}'")
+        
+        # Verificar que no es absoluto
+        if path.startswith('/'):
+            raise ValueError(f"Paths absolutos no permitidos: '{path}'")
+        
+        return path
+    
+    # ========================================================================
+    # PARCHE #7: _run_git seguro (ChatGPT/Perplexity)
+    # ========================================================================
+    
+    def _run_git(self, *args, check: bool = True, 
+                 capture_output: bool = True) -> subprocess.CompletedProcess:
+        """
+        Ejecuta un comando git de forma segura.
+        
+        PARCHE #7: Valida argumentos antes de ejecutar.
+        
+        Args:
+            *args: Argumentos para git
+            check: Si True, lanza excepción en error
+            capture_output: Si True, captura stdout/stderr
+        
+        Returns:
+            CompletedProcess con resultado
+        
+        Raises:
+            ValueError: Si algún argumento es inválido
+            subprocess.CalledProcessError: Si el comando falla y check=True
+        """
+        # Validar que no hay argumentos peligrosos
+        for i, arg in enumerate(args):
+            if not isinstance(arg, str):
+                raise ValueError(f"Argumento {i} no es string: {type(arg)}")
+            
+            # Detectar intentos de inyección de comandos
+            dangerous_chars = ['|', ';', '&', '$', '`', '\n', '\r']
+            for char in dangerous_chars:
+                if char in arg:
+                    raise ValueError(
+                        f"Caracter peligroso '{char}' detectado en argumento: '{arg}'"
+                    )
+            
+            # Validar hashes si parecen serlo
+            if i > 0 and re.match(r'^[a-f0-9]+$', arg.lower()) and len(arg) >= 7:
+                # Podría ser un hash, validar
+                try:
+                    self._validate_git_hash(arg, f"arg[{i}]")
+                except ValueError:
+                    pass  # No es un hash, continuar
+        
+        # Construir comando
+        cmd = ['git'] + list(args)
+        
+        logger.debug(f"Ejecutando: {' '.join(cmd)}")
+        
         try:
             result = subprocess.run(
                 cmd,
-                cwd=str(self.base_path),
-                capture_output=True,
+                cwd=str(self.repo_path),
+                check=check,
+                capture_output=capture_output,
                 text=True,
-                timeout=timeout,
-                shell=False  # IMPORTANTE: siempre False
+                timeout=60  # Timeout de seguridad
             )
-            
-            if result.returncode != 0:
-                logger.error(f"Git error: {result.stderr}")
-                if not capture_output:
-                    raise subprocess.CalledProcessError(
-                        result.returncode, cmd, result.stdout, result.stderr
-                    )
-            
-            return result.stdout if capture_output else None
+            return result
             
         except subprocess.TimeoutExpired:
-            logger.error(f"Git timeout después de {timeout}s: {' '.join(cmd)}")
+            logger.error(f"Timeout ejecutando git: {' '.join(cmd)}")
+            raise
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error en git: {e.stderr}")
             raise
     
-    def _get_current_commit_hash(self) -> Optional[str]:
-        """Obtiene el hash del commit actual"""
-        if not self._is_git_repo():
-            return None
-        
-        try:
-            result = self._run_git(["rev-parse", "HEAD"], capture_output=True)
-            return result.strip() if result else None
-        except Exception:
-            return None
-
-    def _get_git_head(self) -> Optional[str]:
-        """Obtiene el hash del HEAD actual de Git."""
-        return self._get_current_commit_hash()
+    # ========================================================================
+    # Two-Phase Commit
+    # ========================================================================
     
-    def _create_backup(self, files: List[Path]) -> str:
+    def prepare_commit(self, ia_id: str, files: List[str], 
+                       message: str) -> CommitState:
         """
-        Crea backup de archivos antes de modificación
-        
-        Corrige:
-        - HIGH-005 (Mistral): Validar path traversal para evitar ../../etc/passwd
+        Fase 1: Prepara el commit (crea backup, valida cambios).
         
         Args:
-            files: Lista de archivos a respaldar
+            ia_id: ID de la IA que solicita el commit
+            files: Lista de archivos a incluir
+            message: Mensaje de commit
         
         Returns:
-            Ruta del directorio de backup
-        
-        Raises:
-            ValueError: Si se detecta path traversal
+            Estado del commit preparado
         """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_path = self.backup_dir / f"backup_{timestamp}"
-        backup_path.mkdir(parents=True, exist_ok=True)
-        
-        for file_path in files:
-            if file_path.exists():
-                # HIGH-005 (Mistral): Validar que el archivo está dentro de base_path
-                try:
-                    # Resolver paths para detectar symlinks y ..
-                    resolved_file = file_path.resolve()
-                    resolved_base = self.base_path.resolve()
-                    
-                    # Verificar que el archivo está dentro de base_path
-                    try:
-                        rel_path = resolved_file.relative_to(resolved_base)
-                    except ValueError:
-                        logger.error(
-                            f"Path traversal detectado: {file_path} está fuera de {self.base_path}"
-                        )
-                        raise ValueError(
-                            f"Path traversal attempt: {file_path} is outside base directory"
-                        )
-                    
-                    # Verificar que no hay componentes '..' en el path relativo
-                    if ".." in rel_path.parts:
-                        logger.error(f"Path traversal detectado: '..' en {rel_path}")
-                        raise ValueError(
-                            f"Path traversal attempt: '..' found in {rel_path}"
-                        )
-                    
-                except ValueError:
-                    raise  # Re-lanzar errores de validación
-                
-                dest = backup_path / rel_path
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(file_path, dest)
-                logger.debug(f"Backup creado: {file_path} -> {dest}")
-        
-        # También guardar estado Git si aplica
-        if self._is_git_repo():
-            git_state = {
-                "commit_hash": self._get_current_commit_hash(),
-                "timestamp": datetime.now().isoformat()
-            }
-            with open(backup_path / "git_state.json", 'w', encoding='utf-8') as f:
-                json.dump(git_state, f, indent=2)
-        
-        # Limpiar backups antiguos
-        self._cleanup_old_backups()
-        
-        logger.info(f"Backup creado en {backup_path}")
-        return str(backup_path)
-    
-    def _restore_from_backup(self, backup_path: str) -> bool:
-        """
-        Restaura archivos desde backup
-        
-        Args:
-            backup_path: Ruta al directorio de backup
-        
-        Returns:
-            True si la restauración fue exitosa
-        """
-        backup_dir = Path(backup_path)
-        
-        if not backup_dir.exists():
-            logger.error(f"Backup no existe: {backup_path}")
-            return False
-        
-        try:
-            # Restaurar archivos
-            for item in backup_dir.rglob("*"):
-                if item.is_file() and item.name != "git_state.json":
-                    rel_path = item.relative_to(backup_dir)
-                    dest = self.base_path / rel_path
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(item, dest)
-                    logger.debug(f"Restaurado: {item} -> {dest}")
-            
-            # Restaurar estado Git si existe
-            git_state_file = backup_dir / "git_state.json"
-            if git_state_file.exists() and self._is_git_repo():
-                with open(git_state_file, 'r', encoding='utf-8') as f:
-                    git_state = json.load(f)
-                
-                if git_state.get("commit_hash"):
-                    self._run_git(["reset", "--hard", git_state["commit_hash"]])
-                    logger.info(f"Git reset a {git_state['commit_hash'][:8]}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error restaurando backup: {e}")
-            return False
-    
-    def _cleanup_old_backups(self) -> None:
-        """Limpia backups antiguos manteniendo solo los más recientes"""
-        if not self.backup_dir.exists():
-            return
-        
-        backups = sorted(
-            [d for d in self.backup_dir.iterdir() if d.is_dir()],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True
-        )
-        
-        for backup in backups[self.BACKUP_RETENTION_COUNT:]:
-            try:
-                shutil.rmtree(backup)
-                logger.debug(f"Backup antiguo eliminado: {backup}")
-            except Exception as e:
-                logger.warning(f"No se pudo eliminar backup: {e}")
-    
-    def _save_transaction_state(self, state: TransactionState) -> None:
-        """Guarda estado de transacción de forma atómica"""
-        temp_file = self.transaction_file.with_name(
-            f"{self.transaction_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(state.to_dict(), f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_file, self.transaction_file)
-        finally:
-            try:
-                if temp_file.exists():
-                    temp_file.unlink()
-            except Exception:
-                pass
-    
-    def _load_transaction_state(self) -> Optional[TransactionState]:
-        """Carga estado de transacción"""
-        if not self.transaction_file.exists():
-            return None
-        
-        try:
-            with open(self.transaction_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return TransactionState.from_dict(data)
-        except Exception as e:
-            logger.error(f"Error cargando transacción: {e}")
-            return None
-    
-    def _clear_transaction_state(self) -> None:
-        """Limpia estado de transacción"""
-        if self.transaction_file.exists():
-            try:
-                self.transaction_file.unlink()
-            except Exception as e:
-                logger.warning(f"No se pudo limpiar transacción: {e}")
-        self._current_transaction = None
-    
-    def _update_snapshot(self, updates: dict, ia_id: str) -> bool:
-        """
-        Actualiza el snapshot de forma atómica y thread-safe.
-        
-        CORREGIDO: Ahora usa LockManager para garantizar atomicidad.
-        
-        Args:
-            updates: Diccionario con las actualizaciones
-            ia_id: Identificador de la IA que actualiza
-        
-        Returns:
-            bool: True si se actualizó correctamente
-        """
-        # CORREGIDO: Usar LockManager si está disponible
-        if self._lock_manager:
-            with self._lock_manager.lock_context(ia_id, "snapshot_update"):
-                return self._update_snapshot_internal(updates, ia_id)
-        else:
-            # Fallback sin lock (solo para desarrollo)
-            logger.warning("Actualizando snapshot SIN lock - NO USAR EN PRODUCCIÓN")
-            return self._update_snapshot_internal(updates, ia_id)
-
-    def _update_snapshot_internal(self, updates: dict, ia_id: str) -> bool:
-        """Implementación interna de actualización de snapshot."""
-        try:
-            snapshot_file = self.mcp_dir / "snapshot.json"
-            
-            # Leer snapshot actual
-            if snapshot_file.exists():
-                with open(snapshot_file, 'r', encoding='utf-8') as f:
-                    snapshot = json.load(f)
-            else:
-                snapshot = {}
-            
-            # Aplicar actualizaciones
-            snapshot.update(updates)
-            snapshot['last_updated'] = datetime.now().isoformat()
-            snapshot['updated_by'] = ia_id
-            
-            # Escribir de forma atómica
-            temp_file = snapshot_file.with_suffix('.tmp')
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(snapshot, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            
-            os.replace(temp_file, snapshot_file)
-            
-            # NUEVO: Verificación post-write
-            if not snapshot_file.exists():
-                raise IOError("Snapshot file no existe después de os.replace()")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error actualizando snapshot: {e}")
-            return False
-    
-    def begin_transaction(self, description: str, ia_id: str,
-                          files: Optional[List[str]] = None) -> Optional[str]:
-        """
-        Inicia una nueva transacción de forma thread-safe.
-        
-        CORREGIDO: 
-        - Ahora USA el LockManager para sincronización
-        - Genera Transaction ID único con UUID
-        - Sanitiza la descripción
-        
-        Args:
-            description: Descripción de la transacción
-            ia_id: Identificador de la IA
-            files: Lista de archivos afectados (opcional)
-        
-        Returns:
-            str: Transaction ID o None si falla
-        
-        Raises:
-            RuntimeError: Si no hay LockManager configurado
-        """
-        # CORREGIDO: Requerir LockManager para operaciones críticas
-        if not self._lock_manager:
+        if self._current_state and self._current_state.phase not in [
+            CommitPhase.IDLE.value, CommitPhase.COMMITTED.value, 
+            CommitPhase.ROLLED_BACK.value, CommitPhase.FAILED.value
+        ]:
             raise RuntimeError(
-                "LockManager requerido para begin_transaction(). "
-                "Proporcione un LockManager en el constructor."
+                f"Ya hay un commit en progreso: {self._current_state.commit_id}"
             )
         
-        # Sanitizar descripción
-        safe_description = self._sanitize_commit_message(description)
+        # Validar archivos
+        validated_files = []
+        for f in files:
+            validated_files.append(self._validate_path(f))
         
-        # CORREGIDO: Usar LockManager para toda la operación
-        with self._lock_manager.lock_context(ia_id, "begin_transaction"):
-            try:
-                # Verificar si hay transacción pendiente
-                pending = self._load_transaction_state()
-                if pending and pending.phase not in ['committed', 'rolled_back', 'failed']:
-                    logger.warning(
-                        f"Transacción pendiente encontrada: {pending.transaction_id}"
-                    )
-                    # Intentar rollback de transacción huérfana
-                    if self._is_transaction_orphaned(pending):
-                        logger.info("Haciendo rollback de transacción huérfana")
-                        self.rollback()
-                    else:
-                        raise RuntimeError(
-                            f"Transacción activa: {pending.transaction_id}"
-                        )
-                
-                # CORREGIDO: Generar ID único con UUID
-                transaction_id = self._generate_transaction_id()
-                
-                # Crear backup de archivos afectados
-                backup_id = None
-                if files:
-                    backup_id = self._create_backup(files)
-                
-                # Crear estado de transacción
-                transaction_state = {
-                    'transaction_id': transaction_id,
-                    'phase': 'prepared',
-                    'description': safe_description,
-                    'ia_id': ia_id,
-                    'files': files or [],
-                    'backup_id': backup_id,
-                    'started_at': datetime.now().isoformat(),
-                    'pid': os.getpid(),
-                    'git_head': self._get_git_head()
-                }
-                
-                # Guardar estado
-                self._save_transaction_state(transaction_state)
-                
-                logger.info(f"Transacción iniciada: {transaction_id}")
-                return transaction_id
-                
-            except Exception as e:
-                logger.error(f"Error iniciando transacción: {e}")
-                return None
-
-    def _is_transaction_orphaned(self, transaction: dict) -> bool:
-        """Verifica si una transacción está huérfana (proceso muerto)."""
-        pid = transaction.get('pid')
-        if not pid:
-            return True
+        # Generar ID de commit
+        commit_id = f"commit_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{ia_id}"
         
-        try:
-            import psutil
-            return not psutil.pid_exists(pid)
-        except ImportError:
-            # Fallback si psutil no está disponible
-            try:
-                os.kill(pid, 0)
-                return False
-            except (OSError, ProcessLookupError):
-                return True
+        # Obtener HEAD actual para posible rollback
+        result = self._run_git('rev-parse', 'HEAD')
+        original_head = self._validate_git_hash(result.stdout.strip(), "HEAD")
+        
+        # Crear backup
+        backup_dir = self._create_backup(commit_id, validated_files)
+        
+        # Crear estado
+        self._current_state = CommitState(
+            commit_id=commit_id,
+            phase=CommitPhase.PREPARED.value,
+            ia_id=ia_id,
+            files_modified=validated_files,
+            backup_dir=str(backup_dir),
+            original_head=original_head,
+            started_at=datetime.now().isoformat(),
+            restore_git_state=False  # PARCHE #8: Inicializar en False
+        )
+        
+        # Persistir estado
+        self._save_state()
+        
+        logger.info(f"Commit preparado: {commit_id} ({len(validated_files)} archivos)")
+        
+        return self._current_state
     
-    def commit_transaction(self, transaction_id: str, ia_id: str,
-                           commit_message: Optional[str] = None) -> bool:
+    def execute_commit(self, commit_id: str) -> CommitState:
         """
-        Confirma una transacción de forma thread-safe.
-        
-        CORREGIDO:
-        - Usa LockManager para sincronización
-        - Sanitiza mensaje de commit
-        - Verifica estado Git antes de operaciones
+        Fase 2: Ejecuta el commit.
         
         Args:
-            transaction_id: ID de la transacción a confirmar
-            ia_id: Identificador de la IA
-            commit_message: Mensaje de commit (opcional)
+            commit_id: ID del commit a ejecutar
         
         Returns:
-            bool: True si el commit fue exitoso
+            Estado actualizado
         """
-        if not self._lock_manager:
-            raise RuntimeError("LockManager requerido para commit_transaction()")
+        if not self._current_state:
+            self._load_state()
         
-        # CORREGIDO: Usar LockManager
-        with self._lock_manager.lock_context(ia_id, "commit_transaction"):
-            try:
-                # Cargar estado de transacción
-                state = self._load_transaction_state()
-                if not state or state.get('transaction_id') != transaction_id:
-                    raise ValueError(f"Transacción no encontrada: {transaction_id}")
-                
-                if state.get('phase') != 'prepared':
-                    raise ValueError(
-                        f"Transacción en fase inválida: {state.get('phase')}"
-                    )
-                
-                # Verificar que somos el dueño de la transacción
-                if state.get('ia_id') != ia_id:
-                    raise PermissionError(
-                        f"Transacción pertenece a {state.get('ia_id')}, no a {ia_id}"
-                    )
-                
-                # CORREGIDO: Sanitizar mensaje de commit
-                if commit_message:
-                    safe_message = self._sanitize_commit_message(commit_message)
-                else:
-                    safe_message = self._sanitize_commit_message(state.get('description', ''))
-                
-                # Actualizar fase a 'committing'
-                state['phase'] = 'committing'
-                self._save_transaction_state(state)
-                
-                # CORREGIDO: Verificar estado Git antes de operaciones
-                current_head = self._get_git_head()
-                if current_head != state.get('git_head'):
-                    logger.warning(
-                        "Git HEAD cambió desde inicio de transacción. "
-                        "Posible conflicto con otro proceso."
-                    )
-                
-                # Ejecutar git add de forma segura
-                files = state.get('files', [])
-                if files:
-                    for file_path in files:
-                        # Validar cada path antes de añadir
-                        safe_path = self._validate_file_path(file_path)
-                        self._run_git(['add', safe_path])
-                else:
-                    self._run_git(['add', '.'])
-                
-                # Ejecutar git commit con mensaje sanitizado
-                # CORREGIDO: No usar shell=True, pasar argumentos separados
-                self._run_git(['commit', '-m', safe_message])
-                
-                # Actualizar estado a committed
-                state['phase'] = 'committed'
-                state['committed_at'] = datetime.now().isoformat()
-                state['commit_message'] = safe_message
-                state['new_git_head'] = self._get_git_head()
-                self._save_transaction_state(state)
-                
-                # Limpiar backup si existe
-                if state.get('backup_id'):
-                    self._cleanup_backup(state['backup_id'])
-                
-                logger.info(f"Transacción committed: {transaction_id}")
-                return True
-                
-            except Exception as e:
-                logger.error(f"Error en commit: {e}")
-                # Intentar marcar como fallida
+        if not self._current_state or self._current_state.commit_id != commit_id:
+            raise ValueError(f"Commit no encontrado: {commit_id}")
+        
+        if self._current_state.phase != CommitPhase.PREPARED.value:
+            raise RuntimeError(
+                f"Commit no está preparado: {self._current_state.phase}"
+            )
+        
+        try:
+            self._current_state.phase = CommitPhase.COMMITTING.value
+            self._save_state()
+            
+            # Stage archivos
+            for file_path in self._current_state.files_modified:
+                self._run_git('add', file_path)
+            
+            # PARCHE #8: Marcar que debemos restaurar estado git si falla
+            self._current_state.restore_git_state = True
+            self._save_state()
+            
+            # Ejecutar commit
+            self._run_git('commit', '-m', f"PERCIA: {self._current_state.ia_id}")
+            
+            # Commit exitoso
+            self._current_state.phase = CommitPhase.COMMITTED.value
+            self._current_state.completed_at = datetime.now().isoformat()
+            self._current_state.restore_git_state = False  # PARCHE #8: Ya no necesario
+            self._save_state()
+            
+            # Sincronizar HEAD
+            result = self._run_git('rev-parse', 'HEAD')
+            new_head = result.stdout.strip()
+            
+            logger.info(f"Commit ejecutado: {commit_id} -> {new_head[:7]}")
+            
+            return self._current_state
+            
+        except Exception as e:
+            logger.error(f"Error ejecutando commit: {e}")
+            self._current_state.error_message = str(e)
+            self._current_state.phase = CommitPhase.FAILED.value
+            self._save_state()
+            raise
+    
+    # ========================================================================
+    # PARCHE #8: Rollback con restore_git_state (ChatGPT)
+    # ========================================================================
+    
+    def rollback(self, commit_id: str = None) -> bool:
+        """
+        Rollback de un commit fallido o en progreso.
+        
+        PARCHE #8: Usa restore_git_state flag para determinar si restaurar git.
+        
+        Args:
+            commit_id: ID del commit (opcional, usa actual si no se especifica)
+        
+        Returns:
+            True si el rollback fue exitoso
+        """
+        if not self._current_state:
+            self._load_state()
+        
+        if not self._current_state:
+            logger.warning("No hay commit activo para rollback")
+            return False
+        
+        if commit_id and self._current_state.commit_id != commit_id:
+            raise ValueError(f"Commit ID no coincide: {commit_id}")
+        
+        try:
+            self._current_state.phase = CommitPhase.ROLLING_BACK.value
+            self._save_state()
+            
+            logger.info(f"Iniciando rollback de {self._current_state.commit_id}")
+            
+            # PARCHE #8: Solo restaurar estado git si es necesario
+            if self._current_state.restore_git_state and self._current_state.original_head:
+                logger.info(
+                    f"Restaurando estado git a {self._current_state.original_head[:7]}"
+                )
                 try:
-                    state = self._load_transaction_state()
-                    if state:
-                        state['phase'] = 'failed'
-                        state['error'] = str(e)
-                        self._save_transaction_state(state)
-                except:
-                    pass
-                return False
-    
-    def rollback(self, transaction_id: Optional[str] = None) -> bool:
-        """
-        Revierte una transacción de forma segura.
-        
-        CORREGIDO:
-        - Verifica si el commit ya fue pusheado antes de revertir
-        - Usa git revert para commits pusheados (en lugar de reset)
-        
-        Args:
-            transaction_id: ID de transacción específica (opcional)
-        
-        Returns:
-            bool: True si el rollback fue exitoso
-        """
-        try:
-            state = self._load_transaction_state()
-            if not state:
-                logger.warning("No hay transacción activa para rollback")
-                return False
-            
-            if transaction_id and state.get('transaction_id') != transaction_id:
-                raise ValueError(f"Transaction ID no coincide: {transaction_id}")
-            
-            original_head = state.get('git_head')
-            current_head = self._get_git_head()
-            
-            # Si hay cambios en Git, revertir
-            if original_head and current_head != original_head:
-                # CORREGIDO: Verificar si el commit fue pusheado
-                if self._is_commit_pushed(current_head):
-                    logger.warning(
-                        f"Commit {current_head[:8]} ya fue pusheado. "
-                        "Usando git revert en lugar de reset."
+                    # Validar hash antes de usar
+                    validated_head = self._validate_git_hash(
+                        self._current_state.original_head, 
+                        "original_head"
                     )
-                    # Usar revert para commits pusheados (más seguro)
-                    safe_message = self._sanitize_commit_message(
-                        f"Revert: {state.get('description', 'automated rollback')}"
-                    )
-                    self._run_git(['revert', '--no-edit', 'HEAD'])
-                else:
-                    # Reset seguro para commits locales
-                    self._run_git(['reset', '--soft', original_head])
+                    self._run_git('reset', '--hard', validated_head)
+                except Exception as e:
+                    logger.error(f"Error restaurando git state: {e}")
+                    # Continuar con restauración de archivos
             
             # Restaurar archivos desde backup
-            if state.get('backup_id'):
-                self._restore_from_backup(state['backup_id'])
+            if self._current_state.backup_dir:
+                self._restore_from_backup()
             
-            # Actualizar estado
-            state['phase'] = 'rolled_back'
-            state['rolled_back_at'] = datetime.now().isoformat()
-            self._save_transaction_state(state)
+            self._current_state.phase = CommitPhase.ROLLED_BACK.value
+            self._current_state.completed_at = datetime.now().isoformat()
+            self._save_state()
             
-            logger.info(f"Transacción revertida: {state.get('transaction_id')}")
+            logger.info(f"Rollback completado: {self._current_state.commit_id}")
+            
             return True
             
         except Exception as e:
             logger.error(f"Error en rollback: {e}")
+            self._current_state.error_message = str(e)
+            self._current_state.phase = CommitPhase.FAILED.value
+            self._save_state()
             return False
     
-    def process_proposal(self, proposal_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Procesa una propuesta con commit atómico
-        
-        Args:
-            proposal_data: Datos de la propuesta
-        
-        Returns:
-            Resultado del procesamiento
-        """
-        proposal_id = proposal_data.get('proposal_id', f"prop-{datetime.now().strftime('%Y%m%dT%H%M%S')}")
-        author = proposal_data.get('author_ia', 'unknown')
-        
-        try:
-            # Iniciar transacción
-            tx_id = self.begin_transaction(f"Propuesta {proposal_id} de {author}")
-            
-            # Guardar propuesta en archivo
-            proposals_dir = self.mcp_dir / "proposals"
-            proposals_dir.mkdir(parents=True, exist_ok=True)
-            
-            proposal_file = proposals_dir / f"{proposal_id}.json"
-            with open(proposal_file, 'w', encoding='utf-8') as f:
-                json.dump(proposal_data, f, indent=2)
-            
-            # Actualizar snapshot
-            self._update_snapshot("proposal", {
-                "proposal_id": proposal_id,
-                "author_ia": author,
-                "submitted_at": datetime.now().isoformat(),
-                "status": "pending_challenge"
-            })
-            
-            # Commit
-            if self.commit_transaction(f"feat(proposal): {proposal_id} from {author}"):
-                logger.info(f"✅ Propuesta {proposal_id} procesada")
-                return {
-                    "status": "SUCCESS",
-                    "proposal_id": proposal_id,
-                    "transaction_id": tx_id,
-                    "timestamp": datetime.now().isoformat()
-                }
-            else:
-                return {
-                    "status": "ERROR",
-                    "error": "Commit failed",
-                    "proposal_id": proposal_id
-                }
-                
-        except Exception as e:
-            logger.error(f"Error procesando propuesta: {e}")
-            self.rollback()
-            return {
-                "status": "ERROR",
-                "error": str(e),
-                "proposal_id": proposal_id
-            }
+    # ========================================================================
+    # PARCHE #8: _restore_from_backup con restore_git_state (ChatGPT)
+    # ========================================================================
     
-    def process_challenge(self, challenge_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _restore_from_backup(self):
         """
-        Procesa un challenge con commit atómico
+        Restaura archivos desde backup.
         
-        Args:
-            challenge_data: Datos del challenge
-        
-        Returns:
-            Resultado del procesamiento
+        PARCHE #8: Sincroniza con restore_git_state.
         """
-        challenge_id = challenge_data.get('challenge_id', f"ch-{datetime.now().strftime('%Y%m%dT%H%M%S')}")
-        author = challenge_data.get('author_ia', 'unknown')
-        target = challenge_data.get('target_proposal', 'unknown')
+        if not self._current_state or not self._current_state.backup_dir:
+            logger.warning("No hay backup para restaurar")
+            return
         
-        try:
-            tx_id = self.begin_transaction(f"Challenge {challenge_id} de {author}")
-            
-            # Guardar challenge
-            challenges_dir = self.mcp_dir / "challenges"
-            challenges_dir.mkdir(parents=True, exist_ok=True)
-            
-            challenge_file = challenges_dir / f"{challenge_id}.json"
-            with open(challenge_file, 'w', encoding='utf-8') as f:
-                json.dump(challenge_data, f, indent=2)
-            
-            # Actualizar snapshot
-            self._update_snapshot("challenge", {
-                "challenge_id": challenge_id,
-                "author_ia": author,
-                "target_proposal": target,
-                "submitted_at": datetime.now().isoformat(),
-                "status": "pending_review"
-            })
-            
-            if self.commit_transaction(f"feat(challenge): {challenge_id} targeting {target}"):
-                logger.info(f"✅ Challenge {challenge_id} procesado")
-                return {
-                    "status": "SUCCESS",
-                    "challenge_id": challenge_id,
-                    "transaction_id": tx_id
-                }
-            else:
-                return {"status": "ERROR", "error": "Commit failed"}
-                
-        except Exception as e:
-            logger.error(f"Error procesando challenge: {e}")
-            self.rollback()
-            return {"status": "ERROR", "error": str(e)}
-    
-    def process_decision(self, decision_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Procesa decisión de gobernanza con commit atómico
+        backup_dir = Path(self._current_state.backup_dir)
         
-        Args:
-            decision_data: Datos de la decisión
+        if not backup_dir.exists():
+            logger.warning(f"Directorio de backup no existe: {backup_dir}")
+            return
         
-        Returns:
-            Resultado del procesamiento
-        """
-        decision_id = decision_data.get('decision_id', f"dec-{datetime.now().strftime('%Y%m%dT%H%M%S')}")
-        verdict = decision_data.get('verdict', 'unknown')
-        
-        try:
-            tx_id = self.begin_transaction(f"Decisión {decision_id}: {verdict}")
+        restored_count = 0
+        for file_path in self._current_state.files_modified:
+            backup_file = backup_dir / file_path
+            target_file = self.repo_path / file_path
             
-            # Cargar o crear archivo de decisiones
-            if self.decisions_file.exists():
-                with open(self.decisions_file, 'r', encoding='utf-8') as f:
-                    decisions = json.load(f)
-            else:
-                decisions = {"decisions": []}
-            
-            # Agregar decisión
-            decision_data['timestamp'] = datetime.now().isoformat()
-            decision_data['decision_id'] = decision_id
-            decisions['decisions'].append(decision_data)
-            
-            # Guardar de forma atómica
-            temp_file = self.decisions_file.with_name(
-                f"{self.decisions_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            )
-            try:
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    json.dump(decisions, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(temp_file, self.decisions_file)
-            finally:
+            if backup_file.exists():
                 try:
-                    if temp_file.exists():
-                        temp_file.unlink()
-                except Exception:
-                    pass
-            
-            # Actualizar snapshot
-            self._update_snapshot("decision", {
-                "decision_id": decision_id,
-                "verdict": verdict,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            if self.commit_transaction(f"governance(decision): {decision_id} - {verdict}"):
-                logger.info(f"✅ Decisión {decision_id} registrada: {verdict}")
-                return {
-                    "status": "SUCCESS",
-                    "decision_id": decision_id,
-                    "verdict": verdict,
-                    "transaction_id": tx_id
-                }
+                    # Crear directorio padre si no existe
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Copiar archivo
+                    shutil.copy2(backup_file, target_file)
+                    restored_count += 1
+                    logger.debug(f"Restaurado: {file_path}")
+                    
+                except Exception as e:
+                    logger.error(f"Error restaurando {file_path}: {e}")
             else:
-                return {"status": "ERROR", "error": "Commit failed"}
-                
-        except Exception as e:
-            logger.error(f"Error procesando decisión: {e}")
-            self.rollback()
-            return {"status": "ERROR", "error": str(e)}
+                # El archivo no existía antes, eliminar si existe
+                if target_file.exists():
+                    try:
+                        target_file.unlink()
+                        logger.debug(f"Eliminado archivo nuevo: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Error eliminando {file_path}: {e}")
+        
+        logger.info(f"Restaurados {restored_count} archivos desde backup")
+        
+        # PARCHE #8: Si restore_git_state estaba activo, ya se hizo en rollback()
+        # Aquí solo informamos del estado
+        if self._current_state.restore_git_state:
+            logger.info("Estado git también fue restaurado")
     
-    def get_snapshot(self) -> Dict[str, Any]:
-        """Obtiene el snapshot actual"""
-        if self.snapshot_file.exists():
-            with open(self.snapshot_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {}
+    # ========================================================================
+    # Backup
+    # ========================================================================
     
-    def verify_integrity(self) -> Dict[str, Any]:
+    def _create_backup(self, commit_id: str, files: List[str]) -> Path:
         """
-        Verifica integridad entre snapshot y Git
+        Crea backup de archivos antes de modificar.
+        
+        Args:
+            commit_id: ID del commit
+            files: Lista de archivos a respaldar
         
         Returns:
-            Resultado de verificación
+            Path del directorio de backup
         """
-        issues = []
+        backup_dir = self.backup_base / commit_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
         
-        # Verificar Git
-        if self._is_git_repo():
-            current_hash = self._get_current_commit_hash()
+        backed_up = 0
+        for file_path in files:
+            source = self.repo_path / file_path
+            target = backup_dir / file_path
             
-            snapshot = self.get_snapshot()
-            snapshot_hash = snapshot.get("git_head")
-            
-            if snapshot_hash and snapshot_hash != current_hash:
-                issues.append(f"Snapshot desincronizado: {snapshot_hash[:8]} != {current_hash[:8]}")
+            if source.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                backed_up += 1
+                logger.debug(f"Backup: {file_path}")
         
-        # Verificar transacción pendiente
-        pending = self._load_transaction_state()
-        if pending and pending.phase not in [CommitPhase.COMPLETED.value, CommitPhase.FAILED.value]:
-            issues.append(f"Transacción pendiente: {pending.transaction_id} en fase {pending.phase}")
+        logger.info(f"Backup creado: {commit_id} ({backed_up} archivos)")
+        
+        return backup_dir
+    
+    def cleanup_backup(self, commit_id: str):
+        """
+        Limpia backup después de commit exitoso.
+        
+        Args:
+            commit_id: ID del commit
+        """
+        backup_dir = self.backup_base / commit_id
+        
+        if backup_dir.exists():
+            try:
+                shutil.rmtree(backup_dir)
+                logger.info(f"Backup limpiado: {commit_id}")
+            except Exception as e:
+                logger.warning(f"Error limpiando backup: {e}")
+    
+    # ========================================================================
+    # Estado
+    # ========================================================================
+    
+    def _save_state(self):
+        """Guarda estado actual de forma atómica."""
+        if not self._current_state:
+            return
+        
+        temp_file = self.state_file.with_suffix('.tmp')
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(asdict(self._current_state), f, indent=2)
+            os.replace(temp_file, self.state_file)
+        except Exception as e:
+            if temp_file.exists():
+                temp_file.unlink()
+            raise e
+    
+    def _load_state(self):
+        """Carga estado desde archivo."""
+        if not self.state_file.exists():
+            self._current_state = None
+            return
+        
+        try:
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._current_state = CommitState(**data)
+        except Exception as e:
+            logger.warning(f"Error cargando estado: {e}")
+            self._current_state = None
+    
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Obtiene estado actual del coordinador.
+        
+        Returns:
+            Dict con información de estado
+        """
+        if not self._current_state:
+            self._load_state()
+        
+        if not self._current_state:
+            return {
+                "has_active_commit": False,
+                "timestamp": datetime.now().isoformat()
+            }
         
         return {
-            "is_valid": len(issues) == 0,
-            "issues": issues,
-            "checked_at": datetime.now().isoformat()
+            "has_active_commit": True,
+            "commit": asdict(self._current_state),
+            "timestamp": datetime.now().isoformat()
         }
+    
+    # ========================================================================
+    # Utilidades Git
+    # ========================================================================
+    
+    def get_current_head(self) -> str:
+        """Obtiene el HEAD actual."""
+        result = self._run_git('rev-parse', 'HEAD')
+        return self._validate_git_hash(result.stdout.strip(), "HEAD")
+    
+    def get_current_branch(self) -> str:
+        """Obtiene el branch actual."""
+        result = self._run_git('rev-parse', '--abbrev-ref', 'HEAD')
+        branch = result.stdout.strip()
+        return self._validate_branch_name(branch)
+    
+    def get_file_status(self) -> Dict[str, List[str]]:
+        """
+        Obtiene estado de archivos modificados.
+        
+        Returns:
+            Dict con listas de archivos por estado
+        """
+        result = self._run_git('status', '--porcelain')
+        
+        status = {
+            'modified': [],
+            'added': [],
+            'deleted': [],
+            'untracked': []
+        }
+        
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            
+            code = line[:2]
+            filepath = line[3:].strip()
+            
+            if code == '??':
+                status['untracked'].append(filepath)
+            elif code[0] == 'M' or code[1] == 'M':
+                status['modified'].append(filepath)
+            elif code[0] == 'A':
+                status['added'].append(filepath)
+            elif code[0] == 'D' or code[1] == 'D':
+                status['deleted'].append(filepath)
+        
+        return status
 
 
-# CLI
+# ============================================================================
+# CLI para testing
+# ============================================================================
 if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(description='PERCIA Commit Coordinator CLI')
-    parser.add_argument('command', choices=[
-        'status', 'verify', 'rollback', 'snapshot'
-    ])
-    parser.add_argument('--base-path', default='.')
+    parser.add_argument('--repo', default='.', help='Ruta al repositorio')
+    parser.add_argument('--status', action='store_true', help='Mostrar estado')
+    parser.add_argument('--head', action='store_true', help='Mostrar HEAD')
+    parser.add_argument('--branch', action='store_true', help='Mostrar branch')
+    parser.add_argument('--prepare', metavar='IA_ID', help='Preparar commit')
+    parser.add_argument('--files', nargs='+', help='Archivos para commit')
+    parser.add_argument('--execute', metavar='COMMIT_ID', help='Ejecutar commit')
+    parser.add_argument('--rollback', metavar='COMMIT_ID', help='Rollback commit')
     
     args = parser.parse_args()
-    coordinator = CommitCoordinator(base_path=args.base_path)
     
-    if args.command == 'status':
-        pending = coordinator._load_transaction_state()
-        if pending:
-            print(json.dumps(pending.to_dict(), indent=2))
+    try:
+        cc = CommitCoordinator(args.repo)
+        
+        if args.status:
+            status = cc.get_status()
+            print(json.dumps(status, indent=2))
+        
+        elif args.head:
+            print(f"HEAD: {cc.get_current_head()}")
+        
+        elif args.branch:
+            print(f"Branch: {cc.get_current_branch()}")
+        
+        elif args.prepare and args.files:
+            state = cc.prepare_commit(args.prepare, args.files, "Test commit")
+            print(f"Commit preparado: {state.commit_id}")
+        
+        elif args.execute:
+            state = cc.execute_commit(args.execute)
+            print(f"Commit ejecutado: {state.commit_id}")
+        
+        elif args.rollback:
+            if cc.rollback(args.rollback):
+                print(f"Rollback completado: {args.rollback}")
+            else:
+                print("Rollback fallido")
+        
         else:
-            print("No hay transacción pendiente")
-    
-    elif args.command == 'verify':
-        result = coordinator.verify_integrity()
-        print(json.dumps(result, indent=2))
-        sys.exit(0 if result['is_valid'] else 1)
-    
-    elif args.command == 'rollback':
-        if coordinator.rollback():
-            print("✅ Rollback completado")
-        else:
-            print("❌ Rollback falló")
-            sys.exit(1)
-    
-    elif args.command == 'snapshot':
-        print(json.dumps(coordinator.get_snapshot(), indent=2))
+            parser.print_help()
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)

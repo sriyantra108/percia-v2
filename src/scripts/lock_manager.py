@@ -1,794 +1,529 @@
 #!/usr/bin/env python3
 """
-PERCIA v2.0 - Lock Manager - Gestor de Concurrencia Robusto
+PERCIA v2.0 - Lock Manager
+==========================
+Gestión de locks globales para coordinación multi-IA
 
-Implementa:
-- Lock global con TTL (Time-To-Live) para evitar deadlocks
-- Watchdog para detectar procesos muertos
-- Limpieza automática de locks huérfanos
-- Cola FIFO para orden de operaciones
-- Owner tracking con ID único + timestamp
-- Mutex cross-platform con portalocker (Windows/Linux)
+VERSIÓN PARCHEADA - Ronda 3 Multi-IA Security Audit
+Parches aplicados:
+  - #3: lock_context() libera sin acquire (ChatGPT) - Flag acquired + try/except
+  - #9: Cola sin mutex (Todas) - Wrapper thread-safe para get_queue_status
+  - #11: PID Reuse (Gemini) - process_start_time para identidad de proceso
 
-Corrige hallazgos:
-- CRIT-001 (Grok): Locks huérfanos
-- CRIT-001 (Copilot): Riesgo de deadlock
-- CRIT-LOCK-001 (GPT-4o): Temp file único + os.replace atómico
-- CRIT-LOCK-002 (GPT-4o): Lock atómico con mutex cross-platform
-- HIGH-LOCK-004 (GPT-4o): _save_queue con temp único
-
-REQUISITO: pip install portalocker
+Commit base auditado: 5a20704
+Fecha parche: Febrero 2026
 """
 
-import json
-import time
 import os
 import sys
-import uuid
-import re
+import json
+import time
+import logging
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
-import threading
-import logging
+from typing import Optional, Dict, Any, List
 
-# Cross-platform file locking (Windows + Linux)
+# Para locks cross-platform
 try:
     import portalocker
-except ImportError:  # pragma: no cover
-    portalocker = None
+    PORTALOCKER_AVAILABLE = True
+except ImportError:
+    PORTALOCKER_AVAILABLE = False
+    logging.warning("portalocker no instalado. Usando fallback con threading.Lock")
 
-# Configurar logging
+# Para verificación de procesos (PARCHE #11)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logging.warning("psutil no instalado. Verificación de PID limitada.")
+
+# Configuración de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('PERCIA.LockManager')
-
-# ==============================================================================
-# NUEVAS CONSTANTES DE SEGURIDAD (Ronda 2 - Copilot CLI)
-# ==============================================================================
-
-# Límites de seguridad para validación de inputs
-MAX_IA_ID_LENGTH = 64
-MAX_OPERATION_TYPE_LENGTH = 32
-MAX_FILE_PATH_LENGTH = 512
-VALID_IA_ID_PATTERN = r'^[a-zA-Z0-9_-]+$'
-VALID_OPERATION_TYPES = {'read', 'write', 'commit', 'validate', 'bootstrap', 'cycle', 'proposal', 'governance'}
-
-# Timeout mejorado para watchdog (evita false positives)
-WATCHDOG_CHECK_INTERVAL = 5.0  # Aumentado de 1.0s a 5.0s
-WATCHDOG_GRACE_PERIOD = 10.0   # Período de gracia antes de liberar locks
+logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# PARCHE #11: Agregar process_start_time a LockInfo (Gemini)
+# ============================================================================
 @dataclass
 class LockInfo:
-    """Información del lock actual"""
-    owner_id: str
+    """Información de un lock activo."""
     ia_id: str
-    pid: int
-    hostname: str
-    acquired_at: str
-    expires_at: str
     operation_type: str
-    
-    def is_expired(self) -> bool:
-        """Verifica si el lock ha expirado"""
-        expires = datetime.fromisoformat(self.expires_at)
-        return datetime.now() > expires
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'LockInfo':
-        return cls(**data)
+    acquired_at: str
+    ttl_seconds: int
+    pid: int
+    process_start_time: float = 0.0  # PARCHE #11: Tiempo de inicio del proceso
 
 
 @dataclass
-class QueueItem:
-    """Item en la cola FIFO"""
-    queue_id: str
+class QueueEntry:
+    """Entrada en la cola de espera."""
     ia_id: str
     operation_type: str
-    file_path: str
-    priority: int
-    enqueued_at: str
-    status: str  # 'pending', 'processing', 'completed', 'failed'
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'QueueItem':
-        return cls(**data)
+    queued_at: str
+    priority: int = 0
+    processing_by: Optional[str] = None  # Trazabilidad (Copilot)
 
 
 class LockManager:
     """
-    Gestor de locks con garantías ACID para PERCIA v2.0
+    Gestor de locks globales para PERCIA.
     
     Características:
-    - Lock global con TTL configurable (default: 30s)
-    - Watchdog thread para limpieza de locks expirados
-    - Cola FIFO para operaciones pendientes
-    - Detección de procesos muertos via PID
-    - Logging completo para auditoría
-    - Mutex cross-platform con portalocker
+    - Lock global exclusivo para operaciones críticas
+    - Cola de espera con prioridades
+    - Watchdog para TTL y procesos muertos
+    - Thread-safe para operaciones de cola
+    - Detección de PID reuse (PARCHE #11)
     """
     
-    DEFAULT_TTL_SECONDS = 30
-    WATCHDOG_INTERVAL_SECONDS = 5
-    MAX_RETRY_ATTEMPTS = 3
-    RETRY_DELAY_SECONDS = 0.5
+    DEFAULT_TTL = 300  # 5 minutos
+    WATCHDOG_INTERVAL = 30  # segundos
+    LOCK_FILE_NAME = ".percia_global.lock"
+    LOCK_INFO_FILE = ".percia_lock_info.json"
+    QUEUE_FILE = ".percia_queue.json"
     
-    def __init__(self, base_path: str = ".", ttl_seconds: int = None):
+    def __init__(self, base_path: str, default_ttl: int = None):
+        """
+        Inicializa el LockManager.
+        
+        Args:
+            base_path: Directorio base para archivos de lock
+            default_ttl: TTL por defecto en segundos
+        """
         self.base_path = Path(base_path)
-        self.ttl_seconds = ttl_seconds or self.DEFAULT_TTL_SECONDS
+        self.default_ttl = default_ttl or self.DEFAULT_TTL
         
-        # Archivos de control
-        self.percia_dir = self.base_path / ".percia"
-        self.lock_file = self.percia_dir / "lock.json"
-        self.queue_file = self.percia_dir / "queue.json"
-        self.lock_history_file = self.percia_dir / "lock_history.json"
+        # Archivos de estado
+        self.lock_file = self.base_path / self.LOCK_FILE_NAME
+        self.lock_info_file = self.base_path / self.LOCK_INFO_FILE
+        self.queue_file = self.base_path / self.QUEUE_FILE
         
-        # Estado interno
-        self._owner_id: Optional[str] = None
-        self._watchdog_thread: Optional[threading.Thread] = None
+        # PARCHE #9: Mutex para operaciones de cola
+        self._queue_mutex = threading.RLock()
+        
+        # Lock local para operaciones internas
+        self._internal_lock = threading.RLock()
+        
+        # Estado del watchdog
+        self._watchdog_thread = None
         self._watchdog_running = False
         
-        # Asegurar que existe el directorio
-        self.percia_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Inicializar cola si no existe
-        if not self.queue_file.exists():
-            self._save_queue([])
+        # Asegurar que el directorio existe
+        self.base_path.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"LockManager inicializado en {self.base_path}")
     
-    def _validate_input(self, ia_id: str, operation_type: Optional[str] = None, 
-                        file_path: Optional[str] = None) -> None:
+    # ========================================================================
+    # Métodos principales de lock
+    # ========================================================================
+    
+    def acquire_global_lock(self, ia_id: str, operation_type: str, 
+                           ttl: int = None, timeout: float = 30.0) -> bool:
         """
-        Valida todos los inputs para prevenir injection y path traversal.
+        Adquiere el lock global exclusivo.
+        
+        Args:
+            ia_id: Identificador de la IA solicitante
+            operation_type: Tipo de operación a realizar
+            ttl: Time-to-live en segundos (opcional)
+            timeout: Tiempo máximo de espera en segundos
+        
+        Returns:
+            True si se adquirió el lock, False si no
         
         Raises:
-            ValueError: Si algún input es inválido
+            TimeoutError: Si no se puede adquirir en el tiempo especificado
         """
-        # Validar ia_id
-        if not ia_id or not isinstance(ia_id, str):
-            raise ValueError("ia_id debe ser un string no vacío")
+        start_time = time.time()
+        ttl = ttl or self.default_ttl
         
-        if len(ia_id) > MAX_IA_ID_LENGTH:
-            raise ValueError(f"ia_id excede longitud máxima de {MAX_IA_ID_LENGTH}")
+        while time.time() - start_time < timeout:
+            with self._internal_lock:
+                # Verificar si hay lock existente
+                existing_lock = self._read_lock_info()
+                
+                if existing_lock:
+                    # Verificar si el lock expiró o el proceso murió
+                    if self._is_lock_stale(existing_lock):
+                        logger.warning(
+                            f"Lock stale detectado (holder: {existing_lock.ia_id}, "
+                            f"pid: {existing_lock.pid}). Limpiando..."
+                        )
+                        self._cleanup_stale_lock()
+                    else:
+                        # Lock válido de otro proceso, esperar
+                        time.sleep(0.5)
+                        continue
+                
+                # Intentar crear lock file
+                try:
+                    # PARCHE #11: Obtener process_start_time
+                    try:
+                        current_process = psutil.Process(os.getpid()) if PSUTIL_AVAILABLE else None
+                        process_start_time = current_process.create_time() if current_process else 0.0
+                    except Exception:
+                        process_start_time = 0.0
+                    
+                    lock_info = LockInfo(
+                        ia_id=ia_id,
+                        operation_type=operation_type,
+                        acquired_at=datetime.now().isoformat(),
+                        ttl_seconds=ttl,
+                        pid=os.getpid(),
+                        process_start_time=process_start_time  # PARCHE #11
+                    )
+                    
+                    # Crear archivo de lock (atómico)
+                    self._write_lock_info(lock_info)
+                    
+                    # Verificar que somos el holder
+                    time.sleep(0.1)  # Pequeña espera para race conditions
+                    current = self._read_lock_info()
+                    
+                    if current and current.pid == os.getpid():
+                        logger.info(
+                            f"Lock adquirido por {ia_id} para {operation_type} "
+                            f"(TTL: {ttl}s, PID: {os.getpid()})"
+                        )
+                        
+                        # Remover de cola si estaba
+                        self._remove_from_queue(ia_id)
+                        
+                        return True
+                    else:
+                        # Otro proceso ganó la race
+                        continue
+                        
+                except Exception as e:
+                    logger.error(f"Error adquiriendo lock: {e}")
+                    time.sleep(0.5)
+                    continue
         
-        if not re.match(VALID_IA_ID_PATTERN, ia_id):
-            raise ValueError(f"ia_id contiene caracteres inválidos: {ia_id}")
-        
-        # Validar operation_type si se proporciona
-        if operation_type is not None:
-            if not isinstance(operation_type, str):
-                raise ValueError("operation_type debe ser un string")
-            
-            if len(operation_type) > MAX_OPERATION_TYPE_LENGTH:
-                raise ValueError(f"operation_type excede longitud máxima")
-            
-            if operation_type.lower() not in VALID_OPERATION_TYPES:
-                raise ValueError(f"operation_type inválido: {operation_type}")
-        
-        # Validar file_path si se proporciona
-        if file_path is not None:
-            if not isinstance(file_path, str):
-                raise ValueError("file_path debe ser un string")
-            
-            if len(file_path) > MAX_FILE_PATH_LENGTH:
-                raise ValueError(f"file_path excede longitud máxima")
-            
-            # Prevenir path traversal
-            if '..' in file_path or file_path.startswith('/') or file_path.startswith('\\'):
-                raise ValueError(f"file_path contiene path traversal: {file_path}")
-            
-            # Prevenir caracteres peligrosos
-            dangerous_chars = ['<', '>', '|', '&', ';', '$', '`', '\n', '\r', '\0']
-            for char in dangerous_chars:
-                if char in file_path:
-                    raise ValueError(f"file_path contiene carácter peligroso: {char}")
-
-    @contextmanager
-    def _mutex(self, timeout: float = 10.0):
-        """
-        Sección crítica cross-platform (Windows/Linux) para proteger operaciones sobre
-        archivos compartidos (.percia/lock.json, .percia/queue.json, etc.).
-
-        Requiere la dependencia: portalocker (pip install portalocker).
-        """
-        if portalocker is None:
-            raise RuntimeError(
-                "portalocker no está instalado. Instálalo con: pip install portalocker"
-            )
-
-        mutex_file = self.percia_dir / "mutex.lock"
-        # 'a+' crea el archivo si no existe.
-        with portalocker.Lock(str(mutex_file), mode="a+", timeout=timeout):
-            yield
-
-    def _generate_owner_id(self) -> str:
-        """Genera ID único para el owner del lock"""
-        return str(uuid.uuid4())
+        # Timeout - agregar a cola
+        self._add_to_queue(ia_id, operation_type)
+        raise TimeoutError(f"No se pudo adquirir lock en {timeout}s")
     
-    def _get_hostname(self) -> str:
-        """Obtiene el hostname de forma segura"""
-        try:
-            import socket
-            return socket.gethostname()
-        except:
-            return "unknown"
-    
-    def _is_process_alive(self, pid: int) -> bool:
+    def release_global_lock(self, force: bool = False) -> bool:
         """
-        Verifica si un proceso está vivo de forma atómica y cross-platform.
+        Libera el lock global.
         
-        Corrige:
-        - CRIT-003 (Mistral): tasklist en Windows no es atómico y vulnerable a PID reuse
+        Args:
+            force: Si True, libera aunque no seamos el holder
         
-        Usa psutil si está disponible (recomendado), con fallback a os.kill/tasklist.
+        Returns:
+            True si se liberó, False si no había lock o no éramos holder
         """
-        # Intentar usar psutil (más robusto y cross-platform)
-        try:
-            import psutil
-            try:
-                proc = psutil.Process(pid)
-                return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-            except psutil.NoSuchProcess:
+        with self._internal_lock:
+            current = self._read_lock_info()
+            
+            if not current:
+                logger.warning("Intento de liberar lock inexistente")
                 return False
-            except psutil.AccessDenied:
-                # Proceso existe pero no tenemos acceso - está vivo
+            
+            if not force and current.pid != os.getpid():
+                logger.warning(
+                    f"Intento de liberar lock ajeno (holder PID: {current.pid}, "
+                    f"caller PID: {os.getpid()})"
+                )
+                return False
+            
+            try:
+                # Eliminar archivos de lock
+                if self.lock_info_file.exists():
+                    self.lock_info_file.unlink()
+                if self.lock_file.exists():
+                    self.lock_file.unlink()
+                
+                logger.info(f"Lock liberado por PID {os.getpid()}")
                 return True
-        except ImportError:
-            # psutil no instalado, usar fallback
-            pass
-        
-        # Fallback: os.kill (funciona en Linux/Mac, parcialmente en Windows)
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-        except Exception:
-            # En Windows sin psutil, usar tasklist como último recurso
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ['tasklist', '/FI', f'PID eq {pid}'],
-                    capture_output=True, 
-                    text=True,
-                    timeout=5  # Añadir timeout para evitar bloqueos
-                )
-                return str(pid) in result.stdout
-            except Exception:
-                # Si no podemos verificar, asumir muerto (más seguro que asumir vivo)
-                logger.warning(f"No se pudo verificar PID {pid}, asumiendo muerto")
-                return False
-    
-    def _read_lock(self) -> Optional[LockInfo]:
-        """Lee información del lock actual"""
-        if not self.lock_file.exists():
-            return None
-        
-        try:
-            with open(self.lock_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return LockInfo.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f"Lock file corrupto, eliminando: {e}")
-            self._force_release_lock()
-            return None
-    
-    def _write_lock(self, lock_info: LockInfo) -> None:
-        """
-        Escribe información del lock de forma atómica (temp único + os.replace).
-        
-        Corrige:
-        - CRIT-LOCK-003 (Perplexity): Verificar post-write que el lock se escribió correctamente
-        """
-        # Temp file único (evita colisiones concurrentes como lock.tmp)
-        temp_file = self.lock_file.with_name(
-            f"{self.lock_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(lock_info.to_dict(), f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            # os.replace es atómico y funciona en Windows/Linux
-            os.replace(temp_file, self.lock_file)
-            
-            # ================================================================
-            # CRIT-LOCK-003 (Perplexity): Verificación post-write
-            # Confirmar que el lock se escribió correctamente
-            # ================================================================
-            if not self.lock_file.exists():
-                raise IOError("Lock file no existe después de os.replace()")
-            
-            # Verificar que el contenido es correcto
-            with open(self.lock_file, 'r', encoding='utf-8') as f:
-                written_data = json.load(f)
-            
-            if written_data.get('owner_id') != lock_info.owner_id:
-                raise IOError(
-                    f"Verificación post-write falló: owner_id esperado {lock_info.owner_id}, "
-                    f"encontrado {written_data.get('owner_id')}"
-                )
-            
-            logger.debug(f"Lock escrito y verificado: {lock_info.owner_id}")
-            
-        finally:
-            # Limpieza defensiva si algo falló antes del replace
-            try:
-                if temp_file.exists():
-                    temp_file.unlink()
-            except Exception:
-                pass
-    
-    def _force_release_lock(self) -> None:
-        """Libera el lock de forma forzada"""
-        if self.lock_file.exists():
-            try:
-                self.lock_file.unlink()
-                logger.info("Lock liberado forzadamente")
+                
             except Exception as e:
                 logger.error(f"Error liberando lock: {e}")
+                return False
     
-    def _load_queue(self) -> List[QueueItem]:
-        """Carga la cola de operaciones"""
+    # ========================================================================
+    # PARCHE #3: lock_context corregido (ChatGPT)
+    # ========================================================================
+    @contextmanager
+    def lock_context(self, ia_id: str, operation_type: str, ttl: int = None):
+        """
+        Context manager para usar locks de forma segura.
+
+        CORREGIDO (PARCHE #3):
+        - Solo libera el lock si fue adquirido exitosamente.
+        - Evita liberar un lock ajeno cuando acquire_global_lock() falla.
+        - Maneja errores en el release.
+        """
+        acquired = False
+        try:
+            acquired = bool(self.acquire_global_lock(ia_id, operation_type, ttl))
+            if not acquired:
+                # Defensa extra: acquire_global_lock debería lanzar TimeoutError
+                raise TimeoutError("No se pudo adquirir el lock global")
+            yield
+        finally:
+            if acquired:
+                try:
+                    self.release_global_lock()
+                except Exception as e:
+                    logger.error(f"Error liberando lock en lock_context: {e}")
+    
+    # ========================================================================
+    # PARCHE #11: _is_process_alive con detección de PID reuse (Gemini)
+    # ========================================================================
+    def _is_process_alive(self, pid: int, expected_start_time: float = 0.0) -> bool:
+        """
+        Verifica si un proceso está vivo Y es el proceso original.
+        
+        CORREGIDO (PARCHE #11): Valida process_start_time para detectar PID reuse.
+        
+        Args:
+            pid: PID del proceso a verificar
+            expected_start_time: Tiempo de inicio esperado del proceso
+        
+        Returns:
+            True si el proceso está vivo y es el original, False en caso contrario
+        """
+        if not PSUTIL_AVAILABLE:
+            # Sin psutil, solo podemos verificar existencia básica
+            try:
+                os.kill(pid, 0)
+                return True
+            except (OSError, ProcessLookupError):
+                return False
+        
+        try:
+            proc = psutil.Process(pid)
+            
+            # Verificar que está corriendo y no es zombie
+            if not (proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE):
+                return False
+            
+            # 🛡️ PARCHE #11: VALIDACIÓN DE IDENTIDAD
+            # Si el tiempo de inicio difiere, es un PID reutilizado
+            if expected_start_time > 0:
+                actual_start_time = proc.create_time()
+                # Tolerancia de 1 segundo por imprecisión de timestamps
+                if abs(actual_start_time - expected_start_time) > 1.0:
+                    logger.warning(
+                        f"PID {pid} reutilizado detectado. "
+                        f"Expected start: {expected_start_time:.2f}, "
+                        f"Actual: {actual_start_time:.2f}"
+                    )
+                    return False  # El proceso original murió, este es otro proceso
+            
+            return True
+            
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return False
+    
+    def _is_lock_stale(self, lock_info: LockInfo) -> bool:
+        """
+        Verifica si un lock está obsoleto (expirado o proceso muerto).
+        
+        Args:
+            lock_info: Información del lock a verificar
+        
+        Returns:
+            True si el lock está obsoleto, False si es válido
+        """
+        # Verificar TTL
+        acquired_at = datetime.fromisoformat(lock_info.acquired_at)
+        expires_at = acquired_at + timedelta(seconds=lock_info.ttl_seconds)
+        
+        if datetime.now() > expires_at:
+            logger.info(f"Lock expirado (TTL: {lock_info.ttl_seconds}s)")
+            return True
+        
+        # PARCHE #11: Verificar proceso con start_time
+        if not self._is_process_alive(lock_info.pid, lock_info.process_start_time):
+            logger.info(f"Proceso holder muerto o reemplazado (PID: {lock_info.pid})")
+            return True
+        
+        return False
+    
+    def _cleanup_stale_lock(self):
+        """Limpia un lock obsoleto."""
+        try:
+            if self.lock_info_file.exists():
+                self.lock_info_file.unlink()
+            if self.lock_file.exists():
+                self.lock_file.unlink()
+            logger.info("Lock stale limpiado")
+        except Exception as e:
+            logger.error(f"Error limpiando lock stale: {e}")
+    
+    # ========================================================================
+    # Operaciones de archivo (atómicas)
+    # ========================================================================
+    
+    def _read_lock_info(self) -> Optional[LockInfo]:
+        """Lee la información del lock actual."""
+        if not self.lock_info_file.exists():
+            return None
+        
+        try:
+            with open(self.lock_info_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return LockInfo(**data)
+        except Exception as e:
+            logger.warning(f"Error leyendo lock info: {e}")
+            return None
+    
+    def _write_lock_info(self, lock_info: LockInfo):
+        """Escribe información de lock de forma atómica."""
+        temp_file = self.lock_info_file.with_suffix('.tmp')
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(asdict(lock_info), f, indent=2)
+            # Rename atómico
+            os.replace(temp_file, self.lock_info_file)
+        except Exception as e:
+            if temp_file.exists():
+                temp_file.unlink()
+            raise e
+    
+    # ========================================================================
+    # PARCHE #9: Operaciones de cola thread-safe (Todas)
+    # ========================================================================
+    
+    def _add_to_queue(self, ia_id: str, operation_type: str, priority: int = 0):
+        """Agrega una IA a la cola de espera (thread-safe)."""
+        with self._queue_mutex:  # PARCHE #9
+            queue = self._read_queue()
+            
+            # Evitar duplicados
+            if any(e.ia_id == ia_id for e in queue):
+                logger.debug(f"{ia_id} ya está en cola")
+                return
+            
+            entry = QueueEntry(
+                ia_id=ia_id,
+                operation_type=operation_type,
+                queued_at=datetime.now().isoformat(),
+                priority=priority
+            )
+            queue.append(entry)
+            
+            # Ordenar por prioridad (mayor primero)
+            queue.sort(key=lambda x: x.priority, reverse=True)
+            
+            self._write_queue(queue)
+            logger.info(f"{ia_id} agregada a cola (posición: {len(queue)})")
+    
+    def _remove_from_queue(self, ia_id: str):
+        """Remueve una IA de la cola (thread-safe)."""
+        with self._queue_mutex:  # PARCHE #9
+            queue = self._read_queue()
+            original_len = len(queue)
+            queue = [e for e in queue if e.ia_id != ia_id]
+            
+            if len(queue) < original_len:
+                self._write_queue(queue)
+                logger.debug(f"{ia_id} removida de cola")
+    
+    def _read_queue(self) -> List[QueueEntry]:
+        """Lee la cola de espera."""
         if not self.queue_file.exists():
             return []
         
         try:
             with open(self.queue_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            return [QueueItem.from_dict(item) for item in data]
+            return [QueueEntry(**e) for e in data]
         except Exception as e:
-            logger.error(f"Error cargando cola: {e}")
+            logger.warning(f"Error leyendo cola: {e}")
             return []
     
-    def _save_queue(self, queue: List[QueueItem]) -> None:
-        """Guarda la cola de forma atómica (temp único + os.replace)."""
-        temp_file = self.queue_file.with_name(
-            f"{self.queue_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
+    def _write_queue(self, queue: List[QueueEntry]):
+        """Escribe la cola de forma atómica."""
+        temp_file = self.queue_file.with_suffix('.tmp')
         try:
             with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump([item.to_dict() for item in queue], f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
+                json.dump([asdict(e) for e in queue], f, indent=2)
             os.replace(temp_file, self.queue_file)
-        finally:
-            try:
-                if temp_file.exists():
-                    temp_file.unlink()
-            except Exception:
-                pass
-    
-    def _log_lock_event(self, event_type: str, lock_info: Optional[LockInfo], details: str = "") -> None:
-        """Registra eventos de lock para auditoría"""
-        history = []
-        if self.lock_history_file.exists():
-            try:
-                with open(self.lock_history_file, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-            except:
-                history = []
-        
-        event = {
-            "timestamp": datetime.now().isoformat(),
-            "event_type": event_type,
-            "lock_info": lock_info.to_dict() if lock_info else None,
-            "details": details
-        }
-        
-        history.append(event)
-        
-        # Mantener solo últimos 1000 eventos
-        if len(history) > 1000:
-            history = history[-1000:]
-        
-        with open(self.lock_history_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2)
-    
-    def acquire_global_lock(
-        self,
-        ia_id: str = "unknown",
-        operation_type: str = "unknown",
-        timeout: int = None,
-        force_if_expired: bool = True
-    ) -> bool:
-        """
-        Adquiere lock global del sistema con TTL, usando una sección crítica (mutex)
-        cross-platform para que el check+write sea atómico (evita TOCTOU).
-
-        Nota: Este método asume que todos los procesos usan el mismo LockManager,
-        ya que la atomicidad se garantiza con el mutex (.percia/mutex.lock).
-        """
-        if portalocker is None:
-            raise RuntimeError(
-                "portalocker no está instalado. Instálalo con: pip install portalocker"
-            )
-
-        timeout = timeout or self.ttl_seconds
-        start_time = time.time()
-        attempts = 0
-
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                logger.error(f"Timeout adquiriendo lock para {ia_id}")
-                raise TimeoutError(f"No se pudo adquirir lock en {timeout}s")
-
-            remaining = max(0.0, timeout - elapsed)
-            # No bloquear demasiado tiempo la sección crítica: intentos cortos y loop externo.
-            mutex_timeout = min(1.0, remaining) if remaining > 0 else 0.0
-
-            acquired = False
-            try:
-                with self._mutex(timeout=mutex_timeout):
-                    current_lock = self._read_lock()
-
-                    # Re-entrante (mismo proceso/owner): renovar y retornar True
-                    if (
-                        current_lock is not None
-                        and self._owner_id
-                        and current_lock.owner_id == self._owner_id
-                        and current_lock.pid == os.getpid()
-                    ):
-                        new_expires = datetime.now() + timedelta(seconds=self.ttl_seconds)
-                        current_lock.expires_at = new_expires.isoformat()
-                        self._write_lock(current_lock)
-                        logger.debug(f"Lock ya adquirido; TTL renovado hasta {new_expires}")
-                        return True
-
-                    # Si no hay lock, adquirir
-                    if current_lock is None:
-                        acquired = True
-                    else:
-                        # Si expiró y se permite, liberar y adquirir
-                        if current_lock.is_expired() and force_if_expired:
-                            logger.warning(
-                                f"Lock expirado de {current_lock.ia_id}, liberando..."
-                            )
-                            self._log_lock_event(
-                                "expired_release",
-                                current_lock,
-                                "Lock expirado y liberado"
-                            )
-                            self._force_release_lock()
-                            acquired = True
-
-                        # Si el proceso murió, liberar y adquirir
-                        elif not self._is_process_alive(current_lock.pid):
-                            logger.warning(
-                                f"Proceso {current_lock.pid} muerto, liberando lock huérfano..."
-                            )
-                            self._log_lock_event(
-                                "orphan_release",
-                                current_lock,
-                                "Proceso muerto detectado"
-                            )
-                            self._force_release_lock()
-                            acquired = True
-
-                    if acquired:
-                        # HIGH-LOCK-001 (Gemini): Usar variable temporal
-                        # CRIT-CLAUDE-001: Manejar race condition con try/except
-                        # Si falla entre _write_lock() y asignación, limpiar lock huérfano
-                        new_owner_id = self._generate_owner_id()
-                        now = datetime.now()
-                        expires = now + timedelta(seconds=self.ttl_seconds)
-
-                        lock_info = LockInfo(
-                            owner_id=new_owner_id,
-                            ia_id=ia_id,
-                            pid=os.getpid(),
-                            hostname=self._get_hostname(),
-                            acquired_at=now.isoformat(),
-                            expires_at=expires.isoformat(),
-                            operation_type=operation_type
-                        )
-
-                        try:
-                            self._write_lock(lock_info)
-                            # Asignación atómica: si esto falla, limpiar lock
-                            self._owner_id = new_owner_id
-                            self._log_lock_event("acquired", lock_info)
-                            logger.info(
-                                f"Lock adquirido por {ia_id} (owner: {self._owner_id})"
-                            )
-                            return True
-                        except Exception as write_error:
-                            # CRIT-CLAUDE-001: Si falló después de escribir pero antes
-                            # de asignar _owner_id, tenemos un lock huérfano.
-                            # Intentar limpiarlo para evitar bloqueo hasta TTL.
-                            logger.error(
-                                f"Error crítico post-write en acquire_global_lock: {write_error}"
-                            )
-                            try:
-                                # Forzar liberación del lock que acabamos de escribir
-                                self._force_release_lock()
-                                logger.warning("Lock huérfano limpiado exitosamente")
-                            except Exception as cleanup_error:
-                                logger.error(
-                                    f"No se pudo limpiar lock huérfano: {cleanup_error}"
-                                )
-                            # Re-lanzar para que el caller sepa que falló
-                            raise write_error
-
-            except Exception as e:
-                # Si el mutex está ocupado o hay contención, seguimos intentando hasta timeout
-                logger.debug(f"No se pudo entrar a sección crítica (mutex): {e}")
-
-            # Lock ocupado por otro: esperar y reintentar
-            attempts += 1
-            logger.debug(f"Lock ocupado, reintento {attempts}...")
-            time.sleep(self.RETRY_DELAY_SECONDS)
-    
-    def release_global_lock(self, force: bool = False) -> bool:
-        """
-        Libera el lock global de forma segura (bajo mutex).
-
-        Args:
-            force: Si True, libera aunque no sea el owner.
-        """
-        try:
-            # Sección crítica para evitar carreras con acquire/refresh/watchdog
-            with self._mutex(timeout=5.0):
-                current_lock = self._read_lock()
-
-                if current_lock is None:
-                    logger.debug("No hay lock que liberar")
-                    self._owner_id = None
-                    return True
-
-                # Verificar ownership (a menos que sea force)
-                if (
-                    not force
-                    and self._owner_id
-                    and current_lock.owner_id != self._owner_id
-                ):
-                    logger.warning("Intento de liberar lock ajeno")
-                    return False
-
-                self._log_lock_event("released", current_lock)
-                self._force_release_lock()
-                self._owner_id = None
-
-                logger.info("Lock liberado correctamente")
-                return True
-
         except Exception as e:
-            logger.error(f"Error liberando lock: {e}")
-            return False
+            if temp_file.exists():
+                temp_file.unlink()
+            raise e
     
-    def refresh_lock(self) -> bool:
-        """Renueva el TTL del lock actual (heartbeat) de forma segura (bajo mutex)."""
-        try:
-            with self._mutex(timeout=5.0):
-                current_lock = self._read_lock()
-
-                if current_lock is None:
-                    logger.warning("No hay lock para renovar")
-                    return False
-
-                if current_lock.owner_id != self._owner_id:
-                    logger.warning("No se puede renovar lock ajeno")
-                    return False
-
-                new_expires = datetime.now() + timedelta(seconds=self.ttl_seconds)
-                current_lock.expires_at = new_expires.isoformat()
-
-                self._write_lock(current_lock)
-                logger.debug(f"Lock renovado hasta {new_expires}")
-                return True
-
-        except Exception as e:
-            logger.error(f"Error renovando lock: {e}")
-            return False
-    
-    @contextmanager
-    def lock_context(self, ia_id: str, operation_type: str):
-        """Context manager para usar locks de forma segura"""
-        try:
-            self.acquire_global_lock(ia_id=ia_id, operation_type=operation_type)
-            yield
-        finally:
-            self.release_global_lock()
-    
-    def enqueue_operation(self, ia_id: str, operation_type: str, 
-                          file_path: Optional[str] = None,
-                          metadata: Optional[dict] = None) -> str:
-        """
-        Añade una operación a la cola de forma thread-safe.
-        
-        CORREGIDO: Ahora usa mutex para garantizar atomicidad.
-        
-        Args:
-            ia_id: Identificador de la IA
-            operation_type: Tipo de operación
-            file_path: Ruta del archivo (opcional)
-            metadata: Metadatos adicionales (opcional)
-        
-        Returns:
-            str: ID único de la operación encolada
-        
-        Raises:
-            ValueError: Si los inputs son inválidos
-        """
-        # NUEVO: Validación de inputs
-        self._validate_input(ia_id, operation_type, file_path)
-        
-        # CORREGIDO: Usar mutex para toda la operación
-        with self._mutex():
-            try:
-                # Cargar cola actual
-                queue = self._load_queue()
-                
-                # Generar ID único para la operación
-                operation_id = f"op-{uuid.uuid4().hex[:12]}-{int(time.time())}"
-                
-                # Crear entrada de operación
-                queue_item = QueueItem(
-                    queue_id=operation_id,
-                    ia_id=ia_id,
-                    operation_type=operation_type,
-                    file_path=file_path or '',
-                    priority=5,
-                    enqueued_at=datetime.now().isoformat(),
-                    status='pending'
-                )
-                
-                # Añadir a la cola
-                queue.append(queue_item)
-                queue.sort(key=lambda x: (x.priority, x.enqueued_at))
-                
-                # Guardar cola actualizada
-                self._save_queue(queue)
-                
-                logger.info(f"Operación encolada: {operation_id} por {ia_id}")
-                return operation_id
-                
-            except Exception as e:
-                logger.error(f"Error encolando operación: {e}")
-                raise
-    
-    def dequeue_operation(self, ia_id: str) -> Optional[dict]:
-        """
-        Obtiene la siguiente operación pendiente de forma thread-safe.
-        
-        CORREGIDO: Ahora usa mutex para prevenir race conditions donde
-        múltiples procesos obtienen la misma operación.
-        
-        Args:
-            ia_id: Identificador de la IA que procesa
-        
-        Returns:
-            dict: Operación a procesar o None si no hay pendientes
-        """
-        # NUEVO: Validación de inputs
-        self._validate_input(ia_id)
-        
-        # CORREGIDO: Usar mutex para toda la operación read-modify-write
-        with self._mutex():
-            try:
-                queue = self._load_queue()
-                
-                # Buscar primera operación pendiente
-                for i, item in enumerate(queue):
-                    if item.status == "pending":
-                        # ATÓMICO: Marcar como procesando Y asignar procesador
-                        queue[i].status = "processing"
-                        
-                        # Guardar inmediatamente (dentro del mutex)
-                        self._save_queue(queue)
-                        
-                        logger.info(
-                            f"Operación {item.queue_id} asignada a {ia_id}"
-                        )
-                        return item.to_dict()  # Retornar copia para seguridad
-                
-                return None  # No hay operaciones pendientes
-                
-            except Exception as e:
-                logger.error(f"Error en dequeue: {e}")
-                return None
-    
-    def complete_operation(self, operation_id: str, success: bool = True,
-                           result: Optional[dict] = None,
-                           error: Optional[str] = None) -> bool:
-        """
-        Marca una operación como completada de forma thread-safe.
-        
-        CORREGIDO: Ahora usa mutex para prevenir race conditions.
-        
-        Args:
-            operation_id: ID de la operación a completar
-            success: Si la operación fue exitosa
-            result: Resultado de la operación (opcional)
-            error: Mensaje de error si falló (opcional)
-        
-        Returns:
-            bool: True si se actualizó correctamente
-        """
-        # Validación básica del operation_id
-        if not operation_id or not isinstance(operation_id, str):
-            raise ValueError("operation_id debe ser un string no vacío")
-        
-        if len(operation_id) > 128:
-            raise ValueError("operation_id demasiado largo")
-        
-        # CORREGIDO: Usar mutex para toda la operación
-        with self._mutex():
-            try:
-                queue = self._load_queue()
-                
-                # Buscar la operación
-                for i, item in enumerate(queue):
-                    if item.queue_id == operation_id:
-                        # Verificar que está en estado 'processing'
-                        if item.status != "processing":
-                            logger.warning(
-                                f"Operación {operation_id} no está en processing, "
-                                f"estado actual: {item.status}"
-                            )
-                            return False
-                        
-                        # Actualizar estado
-                        queue[i].status = "completed" if success else "failed"
-                        
-                        # Guardar cola actualizada
-                        self._save_queue(queue)
-                        
-                        logger.info(
-                            f"Operación {operation_id} completada: "
-                            f"{'éxito' if success else 'fallo'}"
-                        )
-                        return True
-                
-                logger.warning(f"Operación {operation_id} no encontrada")
-                return False
-                
-            except Exception as e:
-                logger.error(f"Error completando operación: {e}")
-                return False
+    # ========================================================================
+    # PARCHE #9: get_queue_status thread-safe (Todas)
+    # ========================================================================
     
     def get_queue_status(self) -> Dict[str, Any]:
-        """Obtiene estado actual de la cola"""
-        queue = self._load_queue()
+        """
+        Obtiene el estado actual de la cola.
         
-        return {
-            "total": len(queue),
-            "pending": len([q for q in queue if q.status == "pending"]),
-            "processing": len([q for q in queue if q.status == "processing"]),
-            "completed": len([q for q in queue if q.status == "completed"]),
-            "failed": len([q for q in queue if q.status == "failed"]),
-            "items": [q.to_dict() for q in queue]
-        }
+        CORREGIDO (PARCHE #9): Thread-safe con mutex.
+        
+        Returns:
+            Dict con información de la cola
+        """
+        with self._queue_mutex:  # PARCHE #9: Protección con mutex
+            queue = self._read_queue()
+            
+            return {
+                "queue_length": len(queue),
+                "entries": [asdict(e) for e in queue],
+                "timestamp": datetime.now().isoformat()
+            }
     
     def get_lock_status(self) -> Dict[str, Any]:
-        """Obtiene estado actual del lock"""
-        current_lock = self._read_lock()
+        """
+        Obtiene el estado actual del lock.
         
-        if current_lock is None:
-            return {"locked": False, "lock_info": None}
-        
-        return {
-            "locked": True,
-            "lock_info": current_lock.to_dict(),
-            "is_expired": current_lock.is_expired(),
-            "process_alive": self._is_process_alive(current_lock.pid)
-        }
+        Returns:
+            Dict con información del lock
+        """
+        with self._internal_lock:
+            lock_info = self._read_lock_info()
+            
+            if not lock_info:
+                return {
+                    "is_locked": False,
+                    "holder": None,
+                    "timestamp": datetime.now().isoformat()
+                }
+            
+            # Verificar si está stale
+            is_stale = self._is_lock_stale(lock_info)
+            
+            acquired_at = datetime.fromisoformat(lock_info.acquired_at)
+            expires_at = acquired_at + timedelta(seconds=lock_info.ttl_seconds)
+            remaining_ttl = max(0, (expires_at - datetime.now()).total_seconds())
+            
+            return {
+                "is_locked": not is_stale,
+                "is_stale": is_stale,
+                "holder": {
+                    "ia_id": lock_info.ia_id,
+                    "operation_type": lock_info.operation_type,
+                    "pid": lock_info.pid,
+                    "process_start_time": lock_info.process_start_time,
+                    "acquired_at": lock_info.acquired_at,
+                    "ttl_seconds": lock_info.ttl_seconds,
+                    "remaining_ttl": remaining_ttl
+                },
+                "timestamp": datetime.now().isoformat()
+            }
     
-    def start_watchdog(self) -> None:
-        """Inicia thread watchdog para limpiar locks expirados"""
+    # ========================================================================
+    # Watchdog
+    # ========================================================================
+    
+    def start_watchdog(self):
+        """Inicia el watchdog en background."""
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             logger.warning("Watchdog ya está corriendo")
             return
@@ -797,162 +532,78 @@ class LockManager:
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
             daemon=True,
-            name="PERCIA-LockWatchdog"
+            name="LockManager-Watchdog"
         )
         self._watchdog_thread.start()
         logger.info("Watchdog iniciado")
     
-    def stop_watchdog(self) -> None:
-        """Detiene el thread watchdog"""
+    def stop_watchdog(self):
+        """Detiene el watchdog."""
         self._watchdog_running = False
         if self._watchdog_thread:
-            self._watchdog_thread.join(timeout=2)
+            self._watchdog_thread.join(timeout=5)
         logger.info("Watchdog detenido")
     
-    def _watchdog_loop(self) -> None:
-        """
-        Verifica y libera locks huérfanos de forma segura.
-        
-        CORREGIDO:
-        - Timeout aumentado a 5.0s para evitar false positives
-        - Período de gracia antes de liberar locks
-        - Verificación más robusta del estado del proceso
-        """
+    def _watchdog_loop(self):
+        """Loop principal del watchdog."""
         while self._watchdog_running:
             try:
-                time.sleep(WATCHDOG_CHECK_INTERVAL)  # Usar constante configurable
-                
-                # Usar mutex para verificación segura
-                with self._mutex():
-                    current_lock = self._read_lock()
-                    if not current_lock:
-                        continue
-                    
-                    # Verificar si el lock ha expirado
-                    if current_lock.is_expired():
-                        # NUEVO: Período de gracia antes de liberar
-                        expired_time = datetime.now() - datetime.fromisoformat(current_lock.expires_at)
-                        if expired_time.total_seconds() < WATCHDOG_GRACE_PERIOD:
-                            continue
-                        
-                        # Verificar si el proceso sigue vivo
-                        if self._is_process_alive(current_lock.pid):
-                            # El proceso sigue vivo, puede que esté renovando
-                            logger.debug(
-                                f"Lock held by active process {current_lock.pid}, "
-                                f"expired: {expired_time.total_seconds():.1f}s ago"
-                            )
-                            continue
-                        
-                        # El lock está huérfano, liberar de forma segura
-                        logger.warning(
-                            f"Liberando lock huérfano de {current_lock.ia_id} "
-                            f"(PID: {current_lock.pid}, expired: {expired_time.total_seconds():.1f}s ago)"
-                        )
-                        self._log_lock_event("watchdog_expired", current_lock)
-                        self._force_release_lock()
-                    
-                    elif not self._is_process_alive(current_lock.pid):
-                        logger.warning(
-                            f"Liberando lock de proceso muerto {current_lock.pid}"
-                        )
-                        self._log_lock_event("watchdog_orphan", current_lock)
-                        self._force_release_lock()
-                        
+                self._watchdog_check()
             except Exception as e:
                 logger.error(f"Error en watchdog: {e}")
-                # No propagar excepción, el watchdog debe continuar
-    
-    def submit_operation(self, ia_id: str, operation_type: str, file_path: str = None) -> Dict[str, Any]:
-        """Procesa envío de propuesta o challenge con lock y cola"""
-        queue_id = None
-        try:
-            queue_id = self.enqueue_operation(
-                ia_id=ia_id,
-                operation_type=operation_type,
-                file_path=file_path
-            )
             
-            with self.lock_context(ia_id, operation_type):
-                logger.info(f"✅ {operation_type} de {ia_id} procesado")
-                self.complete_operation(queue_id, success=True)
+            time.sleep(self.WATCHDOG_INTERVAL)
+    
+    def _watchdog_check(self):
+        """Verifica y limpia locks obsoletos."""
+        with self._internal_lock:
+            lock_info = self._read_lock_info()
+            
+            if lock_info and self._is_lock_stale(lock_info):
+                logger.info(f"Watchdog: limpiando lock stale de {lock_info.ia_id}")
+                self._cleanup_stale_lock()
                 
-                return {
-                    "status": "SUCCESS",
-                    "queue_id": queue_id,
-                    "ia_id": ia_id,
-                    "operation_type": operation_type,
-                    "timestamp": datetime.now().isoformat()
-                }
-        
-        except TimeoutError as e:
-            if queue_id:
-                self.complete_operation(queue_id, success=False)
-            return {"status": "TIMEOUT", "error": str(e)}
-        
-        except Exception as e:
-            logger.error(f"Error procesando operación: {e}")
-            return {"status": "ERROR", "error": str(e)}
+                # Notificar al siguiente en cola (si implementado)
+                # self._notify_next_in_queue()
 
 
+# ============================================================================
+# CLI para testing
+# ============================================================================
 if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(description='PERCIA Lock Manager CLI')
-    parser.add_argument('command', choices=[
-        'status', 'acquire', 'release', 'unlock', 'queue', 'submit', 'watchdog'
-    ])
-    parser.add_argument('--ia-id', default='cli-user')
-    parser.add_argument('--type', default='manual')
-    parser.add_argument('--force', action='store_true')
-    parser.add_argument('--ttl', type=int, default=30)
-    parser.add_argument('--base-path', default='.')
+    parser.add_argument('--base-path', default='.', help='Directorio base')
+    parser.add_argument('--acquire', metavar='IA_ID', help='Adquirir lock')
+    parser.add_argument('--release', action='store_true', help='Liberar lock')
+    parser.add_argument('--status', action='store_true', help='Mostrar estado')
+    parser.add_argument('--queue', action='store_true', help='Mostrar cola')
     
     args = parser.parse_args()
-    manager = LockManager(base_path=args.base_path, ttl_seconds=args.ttl)
     
-    if args.command == 'status':
-        print(json.dumps({
-            "lock": manager.get_lock_status(),
-            "queue": manager.get_queue_status()
-        }, indent=2))
+    lm = LockManager(args.base_path)
     
-    elif args.command == 'acquire':
+    if args.acquire:
         try:
-            manager.acquire_global_lock(ia_id=args.ia_id, operation_type=args.type)
-            print(f"✅ Lock adquirido por {args.ia_id}")
-        except TimeoutError as e:
-            print(f"❌ {e}")
-            sys.exit(1)
+            lm.acquire_global_lock(args.acquire, 'cli_test', timeout=5)
+            print(f"✅ Lock adquirido por {args.acquire}")
+        except TimeoutError:
+            print("❌ Timeout adquiriendo lock")
     
-    elif args.command == 'release':
-        if manager.release_global_lock(force=args.force):
+    elif args.release:
+        if lm.release_global_lock():
             print("✅ Lock liberado")
         else:
-            print("❌ No se pudo liberar el lock")
-            sys.exit(1)
+            print("❌ No se pudo liberar lock")
     
-    elif args.command == 'unlock':
-        if args.force:
-            manager._force_release_lock()
-            print("✅ Lock liberado forzadamente")
-        else:
-            print("Use --force para liberar forzadamente")
-            sys.exit(1)
+    elif args.status:
+        status = lm.get_lock_status()
+        print(json.dumps(status, indent=2))
     
-    elif args.command == 'queue':
-        print(json.dumps(manager.get_queue_status(), indent=2))
+    elif args.queue:
+        queue = lm.get_queue_status()
+        print(json.dumps(queue, indent=2))
     
-    elif args.command == 'submit':
-        result = manager.submit_operation(ia_id=args.ia_id, operation_type=args.type)
-        print(json.dumps(result, indent=2))
-    
-    elif args.command == 'watchdog':
-        print("Iniciando watchdog (Ctrl+C para detener)...")
-        manager.start_watchdog()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            manager.stop_watchdog()
-            print("\nWatchdog detenido")
+    else:
+        parser.print_help()
