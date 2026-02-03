@@ -47,12 +47,42 @@ except ImportError:
         "Instalar con: pip install flask-limiter"
     )
 
-# Configuración de logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Configuración de logging (console + rotating file handlers)
+_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'logs')
+os.makedirs(_log_dir, exist_ok=True)
+
+_log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Console handler (keeps existing behavior)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_log_format)
+
+# Access log: all INFO+ messages, rotates at 5MB, keeps 5 backups
+from logging.handlers import RotatingFileHandler
+_access_handler = RotatingFileHandler(
+    os.path.join(_log_dir, 'access.log'),
+    maxBytes=5*1024*1024,
+    backupCount=5,
+    encoding='utf-8'
 )
+_access_handler.setLevel(logging.INFO)
+_access_handler.setFormatter(_log_format)
+
+# Error log: only WARNING+, rotates at 5MB, keeps 10 backups
+_error_handler = RotatingFileHandler(
+    os.path.join(_log_dir, 'error.log'),
+    maxBytes=5*1024*1024,
+    backupCount=10,
+    encoding='utf-8'
+)
+_error_handler.setLevel(logging.WARNING)
+_error_handler.setFormatter(_log_format)
+
+# Configure root logger
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _access_handler, _error_handler])
 logger = logging.getLogger(__name__)
+logger.info('Logging initialized: console + logs/access.log + logs/error.log')
 
 # ============================================================================
 # PARCHE #2: API Key - Fail-closed sin defaults predecibles
